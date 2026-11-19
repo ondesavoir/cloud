@@ -42,6 +42,7 @@ export async function signInAsInvitedMember(
   )
   expect(invited.ok()).toBeTruthy()
   await signOut.click()
+  await expect(page.getByRole('button', { name: '登录', exact: true })).toBeVisible()
   await page.goto(path)
   await signIn(page, email)
   return { email, name }
