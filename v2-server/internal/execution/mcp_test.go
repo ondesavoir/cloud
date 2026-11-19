@@ -30,6 +30,22 @@ func testMCP() *MCPSelection {
 	return &MCPSelection{Bindings: []MCPBinding{{PluginID: "official/acme.tools", PluginVersion: "1.2.3", Settings: map[string]any{}}}}
 }
 
+func TestMCPAuthorizationSurvivesOnlyChangesWithinSelectedIDs(t *testing.T) {
+	initial := testMCP()
+	current := initial.Clone()
+	current.Bindings[0].Revision++
+	current.Bindings[0].PluginVersion = "2.0.0"
+	current.Bindings[0].Settings = nil // a retained identity has no credential values
+	if !initial.SameMembers(current) {
+		t.Fatal("a package update changed the session's authorization")
+	}
+	current.Bindings[0].PluginID = "official/other"
+	empty := &MCPSelection{}
+	if initial.SameMembers(current) || initial.SameMembers(nil) || empty.SameMembers(initial) || !empty.SameMembers(nil) {
+		t.Fatal("selection loss or substitution changed the authorized set")
+	}
+}
+
 func TestMCPSelectionMirrorsProtocol(t *testing.T) {
 	for name, change := range map[string]func(*MCPSelection){
 		"nil settings":    func(s *MCPSelection) { s.Bindings[0].Settings = nil },

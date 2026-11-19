@@ -17,16 +17,17 @@ import (
 // TenantMCP is the read-safe view of a downloaded MCP package and its shared configuration.
 // Installed means the verified package is cached. A session separately confirms Node installation.
 type TenantMCP struct {
-	ID                string                    `json:"id"`
-	Name              string                    `json:"name"`
-	PluginVersion     string                    `json:"pluginVersion"`
-	Revision          int64                     `json:"revision"`
-	State             string                    `json:"state"`
-	Settings          []pluginmarket.MCPSetting `json:"settings"`
-	Values            map[string]any            `json:"values"`
-	ConfiguredSecrets []string                  `json:"configuredSecrets"`
-	Complete          bool                      `json:"complete"`
-	SettingsMissing   []string                  `json:"settingsMissing"`
+	ID                  string                    `json:"id"`
+	Name                string                    `json:"name"`
+	PluginVersion       string                    `json:"pluginVersion"`
+	Revision            int64                     `json:"revision"`
+	State               string                    `json:"state"`
+	Settings            []pluginmarket.MCPSetting `json:"settings"`
+	Values              map[string]any            `json:"values"`
+	ConfiguredSecrets   []string                  `json:"configuredSecrets"`
+	Complete            bool                      `json:"complete"`
+	SettingsMissing     []string                  `json:"settingsMissing"`
+	SettingsUnavailable bool                      `json:"settingsUnavailable,omitempty"`
 }
 
 // TenantMCPs lists tenant-wide installations without returning any secret override or default.
@@ -39,7 +40,16 @@ func (s *Store) TenantMCPs(ctx context.Context, access Access) ([]TenantMCP, err
 	items := []TenantMCP{}
 	for rows.Next() {
 		item, err := scanTenantMCP(rows, access.TenantID)
-		if err != nil {
+		if errors.Is(err, pluginmarket.ErrCredentials) {
+			// Keep the identity and revision available for removal even if one
+			// installation cannot be decrypted with this deployment's key.
+			item.State = "installed"
+			item.SettingsUnavailable = true
+			item.Settings = []pluginmarket.MCPSetting{}
+			item.ConfiguredSecrets = []string{}
+			item.Values = map[string]any{}
+			item.SettingsMissing = []string{}
+		} else if err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -156,8 +166,14 @@ func (s *Store) InstallTenantMCP(ctx context.Context, access Access, space strin
 			return err
 		}
 		out, err = readTenantMCP(ctx, tx, access.TenantID, entry.ID)
-		return err
+		if err != nil {
+			return err
+		}
+		return advanceInstalledMCP(ctx, tx, access.TenantID, out)
 	})
+	if err == nil && s.mcpChanged != nil {
+		s.mcpChanged(access.TenantID, entry.ID)
+	}
 	return out, err
 }
 
@@ -178,6 +194,9 @@ func allocateMCPRevision(ctx context.Context, tx pgx.Tx, tenant, id string, curr
 	 ON CONFLICT(tenant_id,plugin_id) DO UPDATE
 	 SET revision=GREATEST(v2_tenant_mcp_revisions.revision,$3)+1
 	 RETURNING revision`, tenant, id, current).Scan(&revision)
+	if err == nil && revision > execution.MaxMCPCounter {
+		return 0, ErrConflict
+	}
 	return revision, err
 }
 
@@ -245,12 +264,18 @@ func (s *Store) SetTenantMCPSettings(ctx context.Context, access Access, space, 
 			return err
 		}
 		out, err = readTenantMCP(ctx, tx, access.TenantID, id)
-		return err
+		if err != nil {
+			return err
+		}
+		return advanceInstalledMCP(ctx, tx, access.TenantID, out)
 	})
+	if err == nil && s.mcpChanged != nil {
+		s.mcpChanged(access.TenantID, id)
+	}
 	return out, err
 }
 
-// RemoveTenantMCP prevents future sessions from selecting a package. Active snapshots own bytes.
+// RemoveTenantMCP marks this member unavailable for every active session which selected it.
 func (s *Store) RemoveTenantMCP(ctx context.Context, access Access, space, id string, revision int64) error {
 	if !access.Owner() {
 		return ErrForbidden
@@ -258,16 +283,24 @@ func (s *Store) RemoveTenantMCP(ctx context.Context, access Access, space, id st
 	if err := requireSpace(ctx, s.pool, access.TenantID, space); err != nil {
 		return err
 	}
-	tag, err := s.pool.Exec(ctx, `DELETE FROM v2_tenant_mcps WHERE tenant_id=$1 AND plugin_id=$2 AND revision=$3`, access.TenantID, id, revision)
-	if err == nil && tag.RowsAffected() != 1 {
-		return ErrConflict
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `DELETE FROM v2_tenant_mcps WHERE tenant_id=$1 AND plugin_id=$2 AND revision=$3`, access.TenantID, id, revision)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrConflict
+		}
+		return advanceMCPTargets(ctx, tx, access.TenantID, id, mcpTargetMember{State: "unavailable", Code: "mcp_plugin_missing"})
+	})
+	if err == nil && s.mcpChanged != nil {
+		s.mcpChanged(access.TenantID, id)
 	}
 	return err
 }
 
 // ResolveWorkflowMCP freezes tenant-owned metadata and memory-only overrides for one node.
-// Do not load archives while execution's lifecycle admission gate is closed. Opening that
-// gate requires generation-aware package acquisition as well as Controller event support.
+// Package bytes are acquired separately against the admitted session's committed target.
 func (s *Store) ResolveWorkflowMCP(ctx context.Context, scope execution.Scope, project string, ids []string) (*execution.MCPSelection, error) {
 	result := &execution.MCPSelection{Bindings: []execution.MCPBinding{}, Packages: []execution.MCPPackage{}}
 	if len(ids) == 0 {
@@ -289,28 +322,11 @@ func (s *Store) ResolveWorkflowMCP(ctx context.Context, scope execution.Scope, p
 	}
 	defer tx.Rollback(ctx)
 	for _, id := range ordered {
-		var pkg execution.MCPPackage
-		var raw, sealed []byte
-		pkg.PluginID = id
-		err := tx.QueryRow(ctx, `SELECT plugin_version,digest,target,declaration,settings FROM v2_tenant_mcps WHERE tenant_id=$1 AND plugin_id=$2`, scope.TenantID, id).Scan(&pkg.PluginVersion, &pkg.Digest, &pkg.Target, &raw, &sealed)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, &execution.MCPFailure{Code: "mcp_plugin_missing", PluginID: id}
-		}
+		binding, pkg, err := readMCPBinding(ctx, tx, scope.TenantID, id, false)
 		if err != nil {
 			return nil, err
 		}
-		var declaration pluginmarket.MCPDeclaration
-		if json.Unmarshal(raw, &declaration) != nil {
-			return nil, &execution.MCPFailure{Code: "mcp_plugin_missing", PluginID: id}
-		}
-		values, err := pluginmarket.OpenMCPSettings(sealed, scope.TenantID+"/"+id)
-		if err != nil {
-			return nil, &execution.MCPFailure{Code: "mcp_setting_missing", PluginID: id}
-		}
-		if missing := missingMCPSettings(declaration, values); len(missing) > 0 {
-			return nil, &execution.MCPFailure{Code: "mcp_setting_missing", PluginID: id, SettingID: missing[0], Transport: declaration.Transport}
-		}
-		result.Bindings = append(result.Bindings, execution.MCPBinding{PluginID: id, PluginVersion: pkg.PluginVersion, Settings: values})
+		result.Bindings = append(result.Bindings, binding)
 		result.Packages = append(result.Packages, pkg)
 	}
 	if err := result.Validate(); err != nil {
@@ -320,4 +336,34 @@ func (s *Store) ResolveWorkflowMCP(ctx context.Context, scope execution.Scope, p
 		return nil, err
 	}
 	return result, nil
+}
+
+// readMCPBinding resolves one exact tenant installation within the caller's snapshot.
+// Only the live delivery path needs package bytes. Deployment key errors stay retryable.
+func readMCPBinding(ctx context.Context, tx pgx.Tx, tenant, id string, archive bool) (execution.MCPBinding, execution.MCPPackage, error) {
+	b := execution.MCPBinding{PluginID: id}
+	p := execution.MCPPackage{PluginID: id}
+	var raw, sealed []byte
+	err := tx.QueryRow(ctx, `SELECT plugin_version,revision,digest,target,declaration,settings,
+		CASE WHEN $3 THEN archive END FROM v2_tenant_mcps WHERE tenant_id=$1 AND plugin_id=$2`,
+		tenant, id, archive).Scan(&b.PluginVersion, &b.Revision, &p.Digest, &p.Target, &raw, &sealed, &p.Archive)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return b, p, &execution.MCPFailure{Code: "mcp_plugin_missing", PluginID: id}
+	}
+	if err != nil {
+		return b, p, err
+	}
+	p.PluginVersion = b.PluginVersion
+	var declaration pluginmarket.MCPDeclaration
+	if json.Unmarshal(raw, &declaration) != nil {
+		return b, p, pluginmarket.ErrPackage
+	}
+	b.Settings, err = pluginmarket.OpenMCPSettings(sealed, tenant+"/"+id)
+	if err != nil {
+		return b, p, err
+	}
+	if missing := missingMCPSettings(declaration, b.Settings); len(missing) > 0 {
+		return b, p, &execution.MCPFailure{Code: "mcp_setting_missing", PluginID: id, SettingID: missing[0], Transport: declaration.Transport}
+	}
+	return b, p, nil
 }

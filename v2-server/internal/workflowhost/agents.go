@@ -8,6 +8,7 @@ import (
 
 	"github.com/wanglongan587/cloud/v2-server/internal/execution"
 	"github.com/wanglongan587/cloud/v2-server/internal/executionwait"
+	"github.com/wanglongan587/cloud/v2-server/internal/pluginmarket"
 	"github.com/wanglongan587/cloud/v2-server/internal/store"
 	"github.com/wanglongan587/cloud/v2-server/internal/workflow"
 )
@@ -201,6 +202,14 @@ func (h *Host) runAgent(st *runState, d workflow.AgentDispatch, generation uint6
 	}
 	mcp, err := h.store.ResolveWorkflowMCP(h.ctx, st.scope, d.ProjectID, cfg.MCPs)
 	if err != nil {
+		var setup *execution.MCPFailure
+		if !errors.As(err, &setup) {
+			reason := publicReason(err)
+			if errors.Is(err, pluginmarket.ErrCredentials) {
+				reason = pluginmarket.ErrCredentials.Error()
+			}
+			h.log.Warn("resolve workflow MCP", "run", d.RunID, "node_run", d.NodeRunID, "error", reason, "error_type", fmt.Sprintf("%T", err))
+		}
 		fail(mcpFailure(err))
 		return
 	}

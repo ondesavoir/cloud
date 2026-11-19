@@ -4,9 +4,12 @@ package agentruntime
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/wanglongan587/cloud/v2-server/internal/execution"
@@ -23,8 +26,7 @@ func ipcMCP() *execution.MCPSelection {
 }
 
 func TestMCPSpecSerializesOnlyTheSelectedBindings(t *testing.T) {
-	// This tests only construction. Cloud must not start MCP sessions until lifecycle
-	// admission and reliable turn failures are supported by both ends.
+	// Package settings are restricted to the explicit startup bindings.
 	selection := ipcMCP()
 	data, err := json.Marshal(mcpSpec(selection))
 	if err != nil {
@@ -37,6 +39,102 @@ func TestMCPSpecSerializesOnlyTheSelectedBindings(t *testing.T) {
 	empty, err := json.Marshal(mcpSpec(&execution.MCPSelection{}))
 	if err != nil || string(empty) != "[]" {
 		t.Fatal("empty selection inherited previous bindings")
+	}
+}
+
+func TestLostMCPSessionCannotRestartWithHistoryHandoff(t *testing.T) {
+	h := newIPCHarness(t, nil)
+	session := h.session("lost", "workspace")
+	session.MCP = ipcMCP()
+	session.Recovery = &execution.Recovery{Handoff: "previous history"}
+	generation := int64(0)
+	turn := execution.Turn{Ref: execution.Ref{SessionID: session.ID, TurnID: "after-loss"}, Prompt: execution.TextPrompt("continue"), MCPGeneration: &generation}
+	result, err := h.driver.Run(ipcContext(t), h.scope, session, turn, discardIPCEvent)
+	if !errors.Is(err, execution.ErrNodeLost) || !result.NotStarted || result.FailureCode != execution.FailureNodeLost {
+		t.Fatal("a new provider execution replaced the lost MCP session", result.Status, result.FailureCode, err)
+	}
+	select {
+	case <-h.created:
+		t.Fatal("a replacement Node was created")
+	default:
+	}
+}
+
+func TestMCPRefusedTurnReplaysOriginalCommandAfterLatestTarget(t *testing.T) {
+	var desired atomic.Int64
+	var current atomic.Int64
+	var submits atomic.Int32
+	var update node.Message
+	commands := make(chan node.Message, 2)
+	h := newIPCHarness(t, func(f *fakeNodeIPC, m node.Message) bool {
+		switch m.Type {
+		case "get_session_mcp_state", "update_session_mcp":
+			var request struct {
+				Request    string `json:"request_id"`
+				Generation int64
+			}
+			if json.Unmarshal(m.Payload, &request) != nil {
+				return false
+			}
+			if m.Type == "update_session_mcp" {
+				update = m
+				desired.Store(request.Generation)
+			}
+			members := []any{map[string]any{"state": "configured", "plugin_id": "official/acme.tools", "plugin_version": "1.0.0", "configuration_revision": desired.Load()}}
+			f.reply(m, "session_mcp_reply", map[string]any{"request_id": request.Request, "node": f.id, "result": "accepted", "state": map[string]any{"desired": map[string]any{"generation": desired.Load(), "members": members}}})
+			return true
+		case "submit_user_turn":
+			commands <- m
+			if submits.Add(1) == 1 {
+				current.Store(3)
+				f.reply(m, "session_command_rejected", map[string]string{"command_id": "turn-" + digest("append"), "reason": "mcp_update_required"})
+			}
+			return true
+		}
+		return false
+	})
+	h.driver.opts.ReadMCPTarget = func(_ context.Context, _ execution.Scope, _ string, selected *execution.MCPSelection, known int64) (*execution.MCPTarget, error) {
+		g := current.Load()
+		if known == g {
+			return nil, nil
+		}
+		s := ipcMCP()
+		if !selected.SameMembers(s) {
+			return nil, &execution.MCPFailure{Code: "mcp_selection_invalid"}
+		}
+		s.Bindings[0].Revision = g
+		return &execution.MCPTarget{Generation: g, Configured: *s}, nil
+	}
+	ctx := ipcContext(t)
+	session := h.session("lifecycle", "workspace")
+	session.MCP = ipcMCP()
+	run := func(id string, floor int64) <-chan ipcRunOutcome {
+		done := make(chan ipcRunOutcome, 1)
+		go func() {
+			r, e := h.driver.Run(ctx, h.scope, session, execution.Turn{Ref: execution.Ref{SessionID: session.ID, TurnID: id}, Prompt: execution.TextPrompt(id), MCPGeneration: &floor}, discardIPCEvent)
+			done <- ipcRunOutcome{r, e}
+		}()
+		return done
+	}
+	first := run("first", 0)
+	f := receiveIPC(t, h.created)
+	start := nextIPCCommand(t, f, "start_agent_session")
+	f.finishTurn(t, start, "first", "ready")
+	if r := receiveIPC(t, first); r.err != nil {
+		t.Fatal(r.err)
+	}
+	next := run("append", 2)
+	original := receiveIPC(t, commands)
+	replayed := receiveIPC(t, commands)
+	if !bytes.Equal(original.Payload, replayed.Payload) || original.ExecutionID != replayed.ExecutionID || original.OperationID != replayed.OperationID || !bytes.Contains(replayed.Payload, []byte(`"mcp_generation":2`)) {
+		t.Fatal("replayed command changed its coordinates, input or generation floor")
+	}
+	if desired.Load() != 3 || !bytes.Contains(update.Payload, []byte(`"configuration_revision":3`)) || !bytes.Contains(update.Payload, []byte("MCP_SECRET_MARKER")) {
+		t.Fatal("turn replayed before the complete committed update reached the Node")
+	}
+	f.finishTurn(t, replayed, "append", "done")
+	if r := receiveIPC(t, next); r.err != nil || r.result.Status != execution.StatusCompleted {
+		t.Fatal("append did not complete", r.err)
 	}
 }
 
@@ -66,6 +164,64 @@ func TestMCPPackageInstallationKeepsSettingsOutOfControlFrames(t *testing.T) {
 	invalid.Digest = "incorrect"
 	if err := f.project.installMCP(ctx, invalid); err == nil {
 		t.Fatal("invalid package digest accepted")
+	}
+}
+
+// Exercise dispatch after preparation. Normal admission stays gated until updates and
+// observations are also wired; this fixture supplies the already-authorized selection.
+func TestMCPDispatchRequiresCommittedGeneration(t *testing.T) {
+	h := newIPCHarness(t, nil)
+	session := h.session("dispatch", "workspace")
+	a, err := h.driver.session(ipcContext(t), h.scope, session, h.config, execution.CallerWorkflow, newPreparation(execution.Ref{}, discardIPCEvent))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := receiveIPC(t, h.created)
+	sentIPC(f)
+	a.commandMu.Lock()
+	defer a.commandMu.Unlock()
+	a.frozen.MCP = ipcMCP()
+	turn := execution.Turn{Ref: execution.Ref{SessionID: session.ID, TurnID: "first"}}
+	for _, gen := range []*int64{nil, new(int64(-1)), new(int64(1)), new(execution.MaxMCPCounter + 1)} {
+		turn.MCPGeneration = gen
+		if err := a.submit(turn, "first", true); !errors.Is(err, execution.ErrInvalidRequest) {
+			t.Fatalf("invalid start generation accepted: %v", err)
+		}
+	}
+	if len(sentIPC(f)) != 0 {
+		t.Fatal("invalid generation reached the Node")
+	}
+	turn.MCPGeneration = new(int64)
+	if err := a.submit(turn, "first", true); err != nil {
+		t.Fatal(err)
+	}
+	start := nextIPCCommand(t, f, "start_agent_session")
+	var payload struct {
+		Spec struct {
+			Lifecycle bool `json:"mcp_lifecycle"`
+			MCP       []struct {
+				ID string `json:"plugin_id"`
+			} `json:"mcp"`
+		}
+	}
+	if json.Unmarshal(start.Payload, &payload) != nil || !payload.Spec.Lifecycle || len(payload.Spec.MCP) != 1 || payload.Spec.MCP[0].ID != "official/acme.tools" {
+		t.Fatal("start omitted the lifecycle flag or explicit selection")
+	}
+	turn.Ref.TurnID = "next"
+	turn.MCPGeneration = nil
+	if err := a.submit(turn, "next", false); !errors.Is(err, execution.ErrInvalidRequest) || len(sentIPC(f)) != 0 {
+		t.Fatal("follow-up without an admission generation was sent")
+	}
+	turn.MCPGeneration = new(int64(23))
+	if err := a.submit(turn, "next", false); err != nil {
+		t.Fatal(err)
+	}
+	followup := nextIPCCommand(t, f, "submit_user_turn")
+	var cmd struct {
+		Generation *int64 `json:"mcp_generation"`
+	}
+	if json.Unmarshal(followup.Payload, &cmd) != nil || cmd.Generation == nil || *cmd.Generation != 23 || bytes.Contains(followup.Payload, []byte("MCP_SECRET_MARKER")) {
+		t.Fatal("follow-up must send exactly the admitted generation and no settings")
 	}
 }
 
@@ -145,6 +301,45 @@ func TestEmptyMCPDoesNotRequireLifecycleCapability(t *testing.T) {
 				t.Fatalf("empty selection failed: %+v", result)
 			}
 		})
+	}
+}
+
+func TestLostMCPSelectionStopsExistingExecutionBeforeAppend(t *testing.T) {
+	h := newIPCHarness(t, nil)
+	ctx := ipcContext(t)
+	session := h.session("retained", "workspace")
+	first := startIPCRun(h, ctx, session, "first", discardIPCEvent)
+	f := receiveIPC(t, h.created)
+	start := nextIPCCommand(t, f, "start_agent_session")
+	f.finishTurn(t, start, "first", "done")
+	if outcome := receiveIPC(t, first); outcome.err != nil {
+		t.Fatal(outcome.err)
+	}
+	// The fixture's live Agent represents a lifecycle execution; the business session
+	// presented on reattachment has lost its selection. No blank update may replace it.
+	h.driver.mu.Lock()
+	a := h.driver.sessions[session.ID]
+	h.driver.mu.Unlock()
+	a.commandMu.Lock()
+	a.frozen.MCP = ipcMCP()
+	a.commandMu.Unlock()
+	appendDone := startIPCRun(h, ctx, session, "second", discardIPCEvent)
+	outcome := receiveIPC(t, appendDone)
+	if outcome.result.MCPFailure == nil || outcome.result.MCPFailure.Code != "mcp_selection_invalid" || !outcome.result.AgentLost {
+		t.Fatal("session with missing authorization remained usable")
+	}
+	end := receiveIPC(t, f.sent)
+	if end.Type != "end_session" || end.ExecutionID != start.ExecutionID {
+		t.Fatalf("selection loss sent %s to %s", end.Type, end.ExecutionID)
+	}
+	select {
+	case <-a.stopped:
+		t.Fatal("stopped before physical confirmation")
+	default:
+	}
+	f.terminal(end)
+	if err := h.driver.End(ctx, session.ID); err != nil {
+		t.Fatal(err)
 	}
 }
 

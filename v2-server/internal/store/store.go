@@ -19,9 +19,13 @@ var ErrNotFound = errors.New("not found")
 // Store is the v2-server database.
 type Store struct {
 	pool             *pgxpool.Pool
+	mcpChanged       func(tenant, plugin string)
 	officialDisabled bool
 	migrated         []AppliedMigration
 }
+
+// SetMCPChangeObserver registers a post-commit wakeup before the store is shared with workers.
+func (s *Store) SetMCPChangeObserver(observer func(tenant, plugin string)) { s.mcpChanged = observer }
 
 // DisableOfficialMarket configures catalog visibility before the store is shared with workers.
 // It retains durable snapshots for a later re-enable, while preventing new installs from them.

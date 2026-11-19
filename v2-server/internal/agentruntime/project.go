@@ -578,6 +578,15 @@ func (p *projectRuntime) receive() {
 		if err != nil {
 			return
 		}
+		if message.Type == "session_mcp_reply" {
+			p.mu.Lock()
+			agent := p.agents[message.ExecutionID]
+			p.mu.Unlock()
+			if agent != nil {
+				agent.receiveMCPReply(message)
+			}
+			continue
+		}
 		if message.Sequence != nil {
 			if err := json.NewEncoder(p.journal).Encode(message); err != nil || p.journal.Sync() != nil {
 				return

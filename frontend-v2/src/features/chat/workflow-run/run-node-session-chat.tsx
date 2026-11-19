@@ -6,6 +6,7 @@ import { Thread } from '@/components/agent-thread/thread'
 import { useRunTenant } from './run-tenant'
 import { nodeConversationTurns } from './conversation-turns'
 import { useNodeSession } from './node-session'
+import { SessionMcpStatusPanel } from './session-mcp-status'
 import { isNodeWorking } from './run-status-style'
 import { RunNodeSessionActions, type InteractiveNodeTarget } from './run-node-session-actions'
 
@@ -44,6 +45,7 @@ export function RunNodeSessionChat({
   const thread = followed !== null && followed.turns.length > 0 ? followed : recorded
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {tenantId && session && <SessionMcpStatusPanel tid={tenantId} rid={session.runId} nodeRunId={session.nodeRunId} />}
       <div className="flex min-h-0 flex-1 flex-col">
         {thread.turns.length > 0 ? (
           <Thread conversation={thread} onAnswer={noAnswer} />

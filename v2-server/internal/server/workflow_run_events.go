@@ -80,61 +80,17 @@ func (h *handler) workflowRunEvents(w http.ResponseWriter, r *http.Request, a ac
 // caller's tenant membership and locating the run in that tenant, the handler reads the session in
 // the starter's scope so any workspace member can follow live and replayed events.
 func (h *handler) workflowNodeEvents(w http.ResponseWriter, r *http.Request, a access) {
-	s, tenant, ok := h.workflowRunScope(w, a)
+	scope, sessionID, ok := h.workflowAttemptSession(w, r, a)
 	if !ok {
 		return
 	}
-	runID, nodeRunID := r.PathValue("rid"), r.PathValue("nodeRunId")
-	if !workflowUUID.MatchString(runID) {
-		fault(w, http.StatusNotFound, "workflow_run_not_found")
-		return
-	}
-	run, err := s.WorkflowRun(r.Context(), tenant, runID)
-	if err != nil {
-		workflowRunFault(w, err, "workflow node events")
-		return
-	}
-	nodes, err := s.WorkflowRunNodes(r.Context(), tenant, runID)
-	if err != nil {
-		workflowRunFault(w, err, "workflow node events")
-		return
-	}
-	// Replaced failed attempts remain readable through their own session, with the same run
-	// membership and execution-owner checks as live attempts.
-	failed, err := s.WorkflowRunFailedAttempts(r.Context(), tenant, runID)
-	if err != nil {
-		workflowRunFault(w, err, "workflow node history")
-		return
-	}
-	nodes = append(nodes, failed...)
-	var sessionID *string
-	found := false
-	for _, node := range nodes {
-		if node.ID == nodeRunID {
-			sessionID, found = node.SessionID, true
-			break
-		}
-	}
-	if !found {
-		fault(w, http.StatusNotFound, "workflow_node_run_not_found")
-		return
-	}
-	if sessionID == nil {
-		// Not dispatched yet: the session is bound only once its first prompt was accepted.
-		fault(w, http.StatusNotFound, "workflow_node_session_not_found")
-		return
-	}
+	nodeRunID := r.PathValue("nodeRunId")
 	after, ok := eventCursor(r)
 	if !ok {
 		fault(w, http.StatusBadRequest, "invalid_cursor")
 		return
 	}
-	starter := run.StartedBy
-	if starter == "" {
-		starter = a.UserID
-	}
-	scope := execution.Scope{TenantID: tenant, UserID: starter}
-	stream, err := h.opts.Execution.Subscribe(r.Context(), scope, *sessionID, after)
+	stream, err := h.opts.Execution.Subscribe(r.Context(), scope, sessionID, after)
 	switch {
 	case err == nil:
 	case errors.Is(err, execution.ErrNotFound):
@@ -153,4 +109,58 @@ func (h *handler) workflowNodeEvents(w http.ResponseWriter, r *http.Request, a a
 	relaySessionEvents(w, r, stream, func(ctx context.Context, sid, turnID string) (string, error) {
 		return chat.TurnPrompt(ctx, h.opts.Execution, scope, sid, turnID)
 	}, "node_run", nodeRunID)
+}
+
+// workflowAttemptSession resolves the session through a run and attempt in the caller's tenant.
+func (h *handler) workflowAttemptSession(w http.ResponseWriter, r *http.Request, a access) (execution.Scope, string, bool) {
+	s, tenant, ok := h.workflowRunScope(w, a)
+	if !ok {
+		return execution.Scope{}, "", false
+	}
+	runID, nodeRunID := r.PathValue("rid"), r.PathValue("nodeRunId")
+	if !workflowUUID.MatchString(runID) {
+		fault(w, http.StatusNotFound, "workflow_run_not_found")
+		return execution.Scope{}, "", false
+	}
+	run, err := s.WorkflowRun(r.Context(), tenant, runID)
+	if err != nil {
+		workflowRunFault(w, err, "workflow node events")
+		return execution.Scope{}, "", false
+	}
+	nodes, err := s.WorkflowRunNodes(r.Context(), tenant, runID)
+	if err != nil {
+		workflowRunFault(w, err, "workflow node events")
+		return execution.Scope{}, "", false
+	}
+	// Replaced failed attempts remain readable through their own session, with the same run
+	// membership and execution-owner checks as live attempts.
+	failed, err := s.WorkflowRunFailedAttempts(r.Context(), tenant, runID)
+	if err != nil {
+		workflowRunFault(w, err, "workflow node history")
+		return execution.Scope{}, "", false
+	}
+	nodes = append(nodes, failed...)
+	var sessionID *string
+	found := false
+	for _, node := range nodes {
+		if node.ID == nodeRunID {
+			sessionID, found = node.SessionID, true
+			break
+		}
+	}
+	if !found {
+		fault(w, http.StatusNotFound, "workflow_node_run_not_found")
+		return execution.Scope{}, "", false
+	}
+	if sessionID == nil {
+		// Not dispatched yet: the session is bound only once its first prompt was accepted.
+		fault(w, http.StatusNotFound, "workflow_node_session_not_found")
+		return execution.Scope{}, "", false
+	}
+	starter := run.StartedBy
+	if starter == "" {
+		starter = a.UserID
+	}
+	scope := execution.Scope{TenantID: tenant, UserID: starter}
+	return scope, *sessionID, true
 }

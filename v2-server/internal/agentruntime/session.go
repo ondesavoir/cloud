@@ -32,8 +32,10 @@ type turnOutcome struct {
 }
 
 type activeTurn struct {
-	id   string
-	done chan turnOutcome
+	id             string
+	commandID      string
+	done           chan turnOutcome
+	updateRequired chan struct{}
 	// guard limits the Agent's re-sends of model calls cut off at a limit during this turn.
 	guard retryGuard
 }
@@ -68,7 +70,11 @@ type agentSession struct {
 	timing        *preparation
 	// recovered continues a held session whose Agent the previous server process lost: the new
 	// Agent starts with the handoff block (see execution.Recovery).
-	recovered *recoveredHistory
+	recovered    *recoveredHistory
+	mcpRequests  map[string]chan mcpReply // protected by mu
+	mcpWake      chan struct{}            // coalesces committed changes for this selection
+	mcpSync      sync.Mutex               // serializes desired delivery and refused-command reconciliation
+	mcpDelivered int64                    // last desired generation confirmed by this Node incarnation
 }
 
 // recoveredHistory joins a recovered session's new Node history to the one the page showed
@@ -181,7 +187,7 @@ func (d *Driver) session(ctx context.Context, scope execution.Scope, session exe
 				a.prepareErr = execution.ErrUnavailable
 				return
 			}
-			if a.prepareErr = p.prepareMCP(session.MCP); a.prepareErr != nil {
+			if a.prepareErr = a.prepareMCP(prepare, session.MCP); a.prepareErr != nil {
 				return
 			}
 			p.mu.Lock()
@@ -274,7 +280,7 @@ func (a *agentSession) replaceable() bool {
 	return a.ended || a.broken
 }
 
-func (a *agentSession) begin(turn string, emit Emit) (*activeTurn, bool, error) {
+func (a *agentSession) begin(turn string, selection *execution.MCPSelection, emit Emit) (*activeTurn, bool, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.ended || a.ending {
@@ -289,16 +295,34 @@ func (a *agentSession) begin(turn string, emit Emit) (*activeTurn, bool, error) 
 	if a.broken {
 		return nil, false, execution.ErrUnavailable
 	}
+	if !a.frozen.MCP.SameMembers(selection) {
+		// The live Agent could still use the formerly authorized members. Fence all
+		// turns while holding the admission lock; the caller requests a confirmed End.
+		a.broken = true
+		return nil, false, &execution.MCPFailure{Code: "mcp_selection_invalid"}
+	}
 	if a.active != nil {
 		return nil, false, execution.ErrWorkspaceBusy
 	}
 	call := &activeTurn{id: turn, done: make(chan turnOutcome, 1)}
+	if a.started && selection != nil && len(selection.Bindings) > 0 {
+		call.updateRequired = make(chan struct{}, 1)
+	}
+	if a.started {
+		call.commandID = "turn-" + digest(turn)
+	}
 	a.active, a.emit = call, emit
 	// The first turn starts the Agent; submit marks the session started just before it sends.
 	return call, !a.started, nil
 }
 
-func (a *agentSession) submit(turn, text string, fresh bool) error {
+func (a *agentSession) submit(admitted execution.Turn, text string, fresh bool) error {
+	turn := admitted.Ref.TurnID
+	lifecycle := a.frozen.MCP != nil && len(a.frozen.MCP.Bindings) > 0
+	floor := admitted.MCPGeneration
+	if lifecycle != (floor != nil) || floor != nil && (*floor < 0 || *floor > execution.MaxMCPCounter || fresh && *floor != 0) {
+		return execution.ErrInvalidRequest
+	}
 	content := []any{map[string]string{"type": "text", "text": text}}
 	if fresh && a.recovered != nil {
 		// The recorded conversation goes first, as its own block, so the page can leave it out.
@@ -345,12 +369,31 @@ func (a *agentSession) submit(turn, text string, fresh bool) error {
 		if configuration != nil {
 			spec["agent_configuration"] = configuration
 		}
-		if a.frozen.MCP != nil && len(a.frozen.MCP.Bindings) > 0 {
+		if lifecycle {
 			spec["mcp"] = mcpSpec(a.frozen.MCP)
+			spec["mcp_lifecycle"] = true
 		}
-		return a.project.send("start_agent_session", a.execution, map[string]any{"spec": spec})
+		err = a.project.send("start_agent_session", a.execution, map[string]any{"spec": spec})
+		if err == nil && lifecycle && a.project.driver.opts.ReadMCPTarget != nil {
+			// The watcher needs only the original authorization identities.
+			ids := &execution.MCPSelection{Bindings: make([]execution.MCPBinding, len(a.frozen.MCP.Bindings))}
+			for i, b := range a.frozen.MCP.Bindings {
+				ids.Bindings[i].PluginID = b.PluginID
+			}
+			a.mu.Lock()
+			a.frozen.MCP = ids
+			a.mcpWake = make(chan struct{}, 1)
+			a.mcpWake <- struct{}{}
+			a.mu.Unlock()
+			go a.followMCP(ids)
+		}
+		return err
 	}
-	return a.project.send("submit_user_turn", a.execution, map[string]any{"node_id": a.project.nodeID(), "command_id": "turn-" + digest(turn), "turn": map[string]any{"turn_id": turn, "content": content}})
+	command := map[string]any{"node_id": a.project.nodeID(), "command_id": "turn-" + digest(turn), "turn": map[string]any{"turn_id": turn, "content": content}}
+	if lifecycle {
+		command["mcp_generation"] = *floor
+	}
+	return a.project.send("submit_user_turn", a.execution, command)
 }
 
 // requestEnd never takes down the project's shared Node. The Driver owns process-tree retirement.
@@ -469,6 +512,28 @@ func (a *agentSession) observe(message node.Message) (*turnOutcome, bool) {
 		a.requestEnd()
 		return nil, false
 	}
+	if message.Type == "session_turn_failed" {
+		var failure struct {
+			TurnID    string  `json:"turn_id"`
+			CommandID *string `json:"command_id"`
+			Code      string  `json:"code"`
+		}
+		if json.Unmarshal(message.Payload, &failure) != nil || message.Sequence == nil || *message.Sequence == 0 ||
+			call == nil || call.id != failure.TurnID || failure.Code != "mcp_refresh_wait_timeout" ||
+			(failure.CommandID == nil && call.commandID != "") ||
+			(failure.CommandID != nil && (*failure.CommandID == "" || *failure.CommandID != call.commandID)) {
+			a.fail("agent_turn_failure_invalid", execution.ErrUnavailable)
+			a.requestEnd()
+			return nil, false
+		}
+		result := failed(failure.Code)
+		if broken || publicationFailed || a.publish(execution.Event{Ref: execution.Ref{TurnID: call.id}, Kind: execution.EventTurnEnded, Result: &result}) != nil {
+			a.fail("agent_event_write_failed", errEventStore)
+			a.requestEnd()
+			return nil, false
+		}
+		return &turnOutcome{call.id, result, nil}, true
+	}
 	if message.Type == "agent_session_ended" {
 		var ended struct {
 			Kind   string
@@ -528,6 +593,19 @@ func (a *agentSession) observe(message node.Message) (*turnOutcome, bool) {
 		return outcome, !publicationFailed
 	}
 	if message.Type == "session_command_rejected" {
+		var rejection struct {
+			CommandID string `json:"command_id"`
+			Reason    string `json:"reason"`
+		}
+		if json.Unmarshal(message.Payload, &rejection) == nil && rejection.Reason == "mcp_update_required" {
+			if message.Sequence == nil && call != nil && call.updateRequired != nil && call.commandID == rejection.CommandID {
+				select {
+				case call.updateRequired <- struct{}{}:
+				default:
+				}
+			}
+			return nil, false
+		}
 		a.fail("agent_session_ended", execution.ErrSessionEnded)
 		return nil, true
 	}

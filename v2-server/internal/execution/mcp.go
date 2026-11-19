@@ -20,11 +20,35 @@ type MCPSelection struct {
 	Packages []MCPPackage `json:"-"`
 }
 
+// MCPTarget is a single committed generation. Configured bindings and package bytes
+// are transient. Removed or incomplete members still occupy their authorized slots.
+type MCPTarget struct {
+	Generation  int64
+	Configured  MCPSelection `json:"-"`
+	Unavailable map[string]string
+}
+
 // MCPBinding is an exact MCP identity. WireSettings is constructed only at the Node boundary.
 type MCPBinding struct {
-	PluginID      string         `json:"plugin_id"`
-	PluginVersion string         `json:"plugin_version"`
-	Settings      map[string]any `json:"-"`
+	PluginID      string `json:"plugin_id"`
+	PluginVersion string `json:"plugin_version"`
+	// Revision identifies the tenant settings read with this package, without retaining values.
+	Revision int64          `json:"configuration_revision,omitempty"`
+	Settings map[string]any `json:"-"`
+}
+
+// MaxMCPCounter is the largest integer shared exactly by Node and JSON clients.
+const MaxMCPCounter int64 = 1<<53 - 1
+
+// SameMembers compares the immutable authorization set, independently of the versions
+// or settings a later resolution observed. Missing metadata authorizes no members.
+func (s *MCPSelection) SameMembers(other *MCPSelection) bool {
+	if s == nil || other == nil {
+		return (s == nil || len(s.Bindings) == 0) && (other == nil || len(other.Bindings) == 0)
+	}
+	return slices.EqualFunc(s.Bindings, other.Bindings, func(a, b MCPBinding) bool {
+		return a.PluginID == b.PluginID
+	})
 }
 
 // MCPPackage contains verified package bytes, never downloaded using session credentials.
@@ -125,7 +149,7 @@ func (s *MCPSelection) Validate() error {
 	}
 	total, previous := 0, ""
 	for _, b := range s.Bindings {
-		if !ValidMCPPluginID(b.PluginID) || previous >= b.PluginID || !ValidMCPVersion(b.PluginVersion) || b.Settings == nil {
+		if !ValidMCPPluginID(b.PluginID) || previous >= b.PluginID || !ValidMCPVersion(b.PluginVersion) || b.Settings == nil || b.Revision < 0 || b.Revision > MaxMCPCounter {
 			return invalid
 		}
 		previous = b.PluginID

@@ -449,6 +449,241 @@
           }
         }
       }
+    },
+    "/api/v2/tenants/{tid}/workflow-runs/{rid}/nodes/{nodeRunId}/mcp": {
+      "get": {
+        "operationId": "getWorkflowSessionMcp",
+        "tags": [
+          "mcp"
+        ],
+        "parameters": [
+          {
+            "name": "tid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "rid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "nodeRunId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionMcpStatus"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v2/tenants/{tid}/workflow-runs/{rid}/nodes/{nodeRunId}/mcp/probe": {
+      "post": {
+        "operationId": "probeWorkflowSessionMcp",
+        "tags": [
+          "mcp"
+        ],
+        "parameters": [
+          {
+            "name": "tid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "rid",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "nodeRunId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Probe accepted"
+          },
+          "400": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpError"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionMcpProbe"
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -561,6 +796,9 @@
             "items": {
               "type": "string"
             }
+          },
+          "settingsUnavailable": {
+            "type": "boolean"
           }
         },
         "required": [
@@ -698,6 +936,110 @@
           "code",
           "params",
           "requestId"
+        ],
+        "additionalProperties": false
+      },
+      "SessionMcpMember": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "version": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "code": {
+            "type": "string"
+          },
+          "health": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "healthy",
+              "unhealthy"
+            ]
+          },
+          "queued": {
+            "type": "boolean"
+          },
+          "inFlight": {
+            "type": "boolean"
+          },
+          "cleanupPending": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "configured",
+          "health"
+        ],
+        "additionalProperties": false
+      },
+      "SessionMcpStatus": {
+        "type": "object",
+        "properties": {
+          "generation": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "activeGeneration": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "convergence": {
+            "type": "string",
+            "enum": [
+              "unknown",
+              "ended",
+              "stopping",
+              "current",
+              "pending",
+              "blocked",
+              "refreshing"
+            ]
+          },
+          "probeCapacityAvailable": {
+            "type": "boolean"
+          },
+          "canProbe": {
+            "type": "boolean"
+          },
+          "members": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SessionMcpMember"
+            }
+          }
+        },
+        "required": [
+          "convergence",
+          "canProbe",
+          "members"
+        ],
+        "additionalProperties": false
+      },
+      "SessionMcpProbe": {
+        "type": "object",
+        "properties": {
+          "pluginId": {
+            "type": "string"
+          },
+          "generation": {
+            "type": "integer",
+            "format": "int64"
+          }
+        },
+        "required": [
+          "pluginId",
+          "generation"
         ],
         "additionalProperties": false
       }

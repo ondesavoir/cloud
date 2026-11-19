@@ -185,12 +185,15 @@ func CheckoutRefused(code string) bool {
 
 // Turn is the readable record of one accepted prompt. Result is nil only while running.
 type Turn struct {
-	Ref       Ref
-	Caller    Caller
-	Prompt    Prompt
-	StartedAt time.Time
-	EndedAt   *time.Time
-	Result    *Result
+	// MCPGeneration is the minimum desired generation when this turn was admitted.
+	// A nil value preserves ordinary sessions and turns recorded before lifecycle support.
+	MCPGeneration *int64 `json:",omitempty"`
+	Ref           Ref
+	Caller        Caller
+	Prompt        Prompt
+	StartedAt     time.Time
+	EndedAt       *time.Time
+	Result        *Result
 }
 
 // Session is shared execution metadata; page titles, ordering and deletion remain page-owned.

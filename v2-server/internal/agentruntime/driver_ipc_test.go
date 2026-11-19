@@ -310,6 +310,60 @@ func startIPCRun(h *ipcHarness, ctx context.Context, session execution.Session, 
 }
 func discardIPCEvent(context.Context, execution.Event) error { return nil }
 
+func TestDriverIPCTurnFailurePublishesOnceAndKeepsSession(t *testing.T) {
+	h := newIPCHarness(t, nil)
+	ctx := ipcContext(t)
+	session := h.session("session", "workspace")
+	events := make(chan execution.Event, 4)
+	emit := func(_ context.Context, event execution.Event) error {
+		if event.Kind != execution.EventPreparation {
+			events <- event
+		}
+		return nil
+	}
+	first := startIPCRun(h, ctx, session, "first", emit)
+	f := receiveIPC(t, h.created)
+	start := nextIPCCommand(t, f, "start_agent_session")
+	for i, turn := range []string{"first", "second"} {
+		command, done := start, first
+		payload := map[string]string{"turn_id": turn, "code": "mcp_refresh_wait_timeout"}
+		if i > 0 {
+			done = startIPCRun(h, ctx, session, turn, emit)
+			command = nextIPCCommand(t, f, "submit_user_turn")
+			var submission struct {
+				CommandID string `json:"command_id"`
+			}
+			if err := json.Unmarshal(command.Payload, &submission); err != nil || submission.CommandID == "" {
+				t.Fatal("missing command ID", err)
+			}
+			payload["command_id"] = submission.CommandID
+		}
+		raw, err := json.Marshal(payload)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seq := uint64(i + 1)
+		frame := node.Message{Type: "session_turn_failed", Version: 1, OperationID: command.OperationID, ExecutionID: command.ExecutionID, Sequence: &seq, Payload: raw}
+		f.in <- frame
+		event := receiveIPC(t, events)
+		if event.Kind != execution.EventTurnEnded || event.Ref.TurnID != turn || event.Result == nil || event.Result.FailureCode != payload["code"] {
+			t.Fatalf("turn failure publication = %+v", event)
+		}
+		receiveIPC(t, f.acked)
+		got := receiveIPC(t, done)
+		if got.err != nil || got.result.Status != execution.StatusFailed || got.result.AgentLost || got.result.FailureCode != payload["code"] {
+			t.Fatalf("turn failure = %+v", got)
+		}
+		f.in <- frame
+		receiveIPC(t, f.acked)
+		select {
+		case duplicate := <-events:
+			t.Fatalf("replay published twice: %+v", duplicate)
+		default:
+		}
+	}
+}
+
 func TestDriverIPCFullTurnPublicationAppendAndEnd(t *testing.T) {
 	h := newIPCHarness(t, nil)
 	ctx := ipcContext(t)
@@ -1341,7 +1395,7 @@ func TestDriverIPCFirstTurnLostBeforeItsStartIsNotStarted(t *testing.T) {
 	f := receiveIPC(t, h.created)
 	sentIPC(f)
 	a.commandMu.Lock()
-	if _, fresh, err := a.begin("first", discardIPCEvent); err != nil || !fresh {
+	if _, fresh, err := a.begin("first", session.MCP, discardIPCEvent); err != nil || !fresh {
 		t.Fatalf("begin: fresh=%v err=%v", fresh, err)
 	}
 	_ = f.Close()
@@ -1350,7 +1404,7 @@ func TestDriverIPCFirstTurnLostBeforeItsStartIsNotStarted(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the closed transport never failed the project")
 	}
-	err = a.submit("first", "prompt", true)
+	err = a.submit(execution.Turn{Ref: execution.Ref{TurnID: "first"}}, "prompt", true)
 	a.commandMu.Unlock()
 	if !errors.Is(err, execution.ErrUnavailable) {
 		t.Fatalf("submit on a dead Node = %v, want ErrUnavailable", err)
@@ -1376,7 +1430,7 @@ func TestDriverIPCFirstTurnDoesNotStartAnAgentAfterEnd(t *testing.T) {
 	f := receiveIPC(t, h.created)
 	sentIPC(f)
 	a.commandMu.Lock()
-	if _, fresh, err := a.begin("first", discardIPCEvent); err != nil || !fresh {
+	if _, fresh, err := a.begin("first", session.MCP, discardIPCEvent); err != nil || !fresh {
 		t.Fatalf("begin: fresh=%v err=%v", fresh, err)
 	}
 	// End runs between begin and submit: the session has not started, so it only waits for
@@ -1396,7 +1450,7 @@ func TestDriverIPCFirstTurnDoesNotStartAnAgentAfterEnd(t *testing.T) {
 		}
 		time.Sleep(time.Millisecond)
 	}
-	err = a.submit("first", "prompt", true)
+	err = a.submit(execution.Turn{Ref: execution.Ref{TurnID: "first"}}, "prompt", true)
 	a.commandMu.Unlock()
 	if !errors.Is(err, execution.ErrSessionEnded) {
 		t.Fatalf("submit after End = %v, want ErrSessionEnded", err)

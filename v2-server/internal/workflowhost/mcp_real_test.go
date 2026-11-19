@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -32,12 +33,24 @@ import (
 
 const mcpFixtureSecret = "workflow-mcp-private-token"
 
-// The model detects any selected MCP tool. The pinned Node lacks the lifecycle capability,
-// so nonempty selections must fail before a model request, while disabled selections still run.
-type workflowMCPModel struct{ calls atomic.Int64 }
+// The local model calls the selected fixture and recognizes only its two expected setting markers.
+type workflowMCPModel struct {
+	calls atomic.Int64
+	pause atomic.Pointer[mcpModelPause]
+}
+
+type mcpModelPause struct{ entered, resume chan struct{} }
 
 func (m *workflowMCPModel) Complete(w http.ResponseWriter, r *http.Request, model nodeservices.Model) {
 	m.calls.Add(1)
+	if pause := m.pause.Swap(nil); pause != nil {
+		close(pause.entered)
+		select {
+		case <-pause.resume:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	var req struct {
 		Stream   bool `json:"stream"`
 		Messages []struct {
@@ -65,6 +78,8 @@ func (m *workflowMCPModel) Complete(w http.ResponseWriter, r *http.Request, mode
 	if len(req.Messages) > 0 && req.Messages[len(req.Messages)-1].Role == "tool" {
 		if bytes.Contains(req.Messages[len(req.Messages)-1].Content, []byte("MCP_SETTINGS_RECEIVED")) {
 			message["content"] = "MCP_SETTINGS_RECEIVED"
+		} else if bytes.Contains(req.Messages[len(req.Messages)-1].Content, []byte("MCP_SETTINGS_UPDATED")) {
+			message["content"] = "MCP_SETTINGS_UPDATED"
 		} else {
 			message["content"] = "MCP_TOOL_FAILED"
 		}
@@ -105,8 +120,8 @@ for line in sys.stdin:
     elif method == 'tools/list':
         result = {'tools': [{'name': 'mcp_probe', 'description': 'Verify selected MCP configuration', 'inputSchema': {'type': 'object', 'properties': {}}}]}
     elif method == 'tools/call':
-        ok = os.environ.get('MCP_TOKEN') == 'workflow-mcp-private-token'
-        result = {'content': [{'type': 'text', 'text': 'MCP_SETTINGS_RECEIVED' if ok else 'MCP_SETTINGS_MISSING'}]}
+        markers = {'workflow-mcp-private-token': 'MCP_SETTINGS_RECEIVED', 'changed-fixture-token': 'MCP_SETTINGS_UPDATED'}
+        result = {'content': [{'type': 'text', 'text': markers.get(os.environ.get('MCP_TOKEN'), 'MCP_SETTINGS_MISSING')}]}
     else:
         result = {}
     print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
@@ -133,7 +148,75 @@ for line in sys.stdin:
 	return archive.Bytes(), hex.EncodeToString(digest[:])
 }
 
-func TestRealWorkflowMCPLifecycleGate(t *testing.T) {
+// The browser test installs the same stdio fixture into its isolated Playwright database.
+func TestInstallBrowserMCPFixture(t *testing.T) {
+	tenant := os.Getenv("E2E_MCP_FIXTURE_TENANT")
+	if tenant == "" {
+		t.Skip("only invoked by the browser lifecycle test")
+	}
+	ctx := t.Context()
+	db, err := store.Open(ctx, os.Getenv("E2E_DATABASE_URL"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	access, err := db.TenantAccess(ctx, tenant, os.Getenv("E2E_MCP_FIXTURE_USER"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive, digest := workflowMCPArchive(t)
+	source := workflowMCPSource(digest)
+	if _, err := db.InstallTenantMCP(ctx, access, os.Getenv("E2E_MCP_FIXTURE_SPACE"), source, archive, 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func workflowMCPSource(digest string) store.PluginPackageSource {
+	return store.PluginPackageSource{Entry: store.PluginCatalogEntry{ID: "official/fixture.workflow-mcp", SourceNamespace: "official", Identifier: "fixture.workflow-mcp", Kind: "mcp", Version: "1.0.0", Title: "Workflow MCP", MarketplaceVisible: true}, Digest: digest}
+}
+
+func TestInteractiveMCPKeyFailureBeforeStart(t *testing.T) {
+	f := newFixture(t)
+	ctx := t.Context()
+	access := storetest.Access(t, f.s, f.scope.TenantID, f.scope.UserID)
+	spaces, err := f.s.TenantSpaces(ctx, access)
+	if err != nil || len(spaces) == 0 {
+		t.Fatal("fixture space unavailable", err)
+	}
+	t.Setenv("V2_MARKET_CREDENTIAL_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
+	archive, digest := workflowMCPArchive(t)
+	item, err := f.s.InstallTenantMCP(ctx, access, spaces[0].ID, workflowMCPSource(digest), archive, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.s.SetTenantMCPSettings(ctx, access, spaces[0].ID, item.ID, item.Revision, map[string]any{"token": mcpFixtureSecret}, nil); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("V2_MARKET_CREDENTIAL_KEY", "")
+	var logs bytes.Buffer
+	f.host.log = slog.New(slog.NewTextHandler(&logs, nil))
+	graph := strings.Replace(interactiveChain, `"interactive":true`, `"interactive":true,"mcps":[{"mcpId":"official/fixture.workflow-mcp","enabled":true}]`, 1)
+	rid := f.run(t, graph, str("check"))
+	if _, err := f.host.StartRun(ctx, f.scope, rid); err != nil {
+		t.Fatal(err)
+	}
+	_, nodes := f.await(t, rid, terminal)
+	n := node(nodes, "a")
+	var payload struct {
+		Detail map[string]any `json:"error_detail"`
+	}
+	if err := json.Unmarshal(n.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if n.SessionID != nil || payload.Detail["kind"] != "interactive_session" || payload.Detail["auto_retryable"] != false {
+		t.Fatal("interactive pre-start failure lost its retry policy", payload.Detail)
+	}
+	if !strings.Contains(logs.String(), rid) || !strings.Contains(logs.String(), n.ID) || strings.Contains(logs.String(), mcpFixtureSecret) {
+		t.Fatal("missing run correlation or unsafe credential diagnostic")
+	}
+}
+
+func TestRealWorkflowMCPLifecycle(t *testing.T) {
 	assets := os.Getenv("V2_NODE_ASSETS_DIR")
 	if assets == "" {
 		t.Skip("set V2_NODE_ASSETS_DIR for real Node and OpenCode")
@@ -180,7 +263,8 @@ func TestRealWorkflowMCPLifecycleGate(t *testing.T) {
 	}
 	driver, err := agentruntime.New(agentruntime.Options{
 		Root: filepath.Join(root, "n"), AssetsDirectory: assets, GitBackend: filepath.Join(strings.TrimSpace(string(gitPath)), "git-http-backend"),
-		Bindings: map[string]nodeservices.Binding{"fixture": model.Binding},
+		Bindings:      map[string]nodeservices.Binding{"fixture": model.Binding},
+		ReadMCPTarget: db.ReadSessionMCPTarget,
 		ResolveProject: func(c context.Context, s execution.Scope, id string) (agentruntime.Project, error) {
 			p, e := db.GetProject(c, s, id)
 			return agentruntime.Project{MirrorPath: p.MirrorPath, Commit: p.Commit, SnapshotRef: p.SnapshotRef}, e
@@ -197,6 +281,7 @@ func TestRealWorkflowMCPLifecycleGate(t *testing.T) {
 			t.Error(err)
 		}
 	})
+	db.SetMCPChangeObserver(driver.MCPChanged)
 	service, err := executionruntime.New(ctx, executionruntime.Config{Store: db, Models: models, Agent: driver})
 	if err != nil {
 		t.Fatal(err)
@@ -211,7 +296,7 @@ func TestRealWorkflowMCPLifecycleGate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := store.PluginPackageSource{Entry: store.PluginCatalogEntry{ID: "official/fixture.workflow-mcp", SourceNamespace: "official", Identifier: "fixture.workflow-mcp", Kind: "mcp", Version: "1.0.0", Title: "Workflow MCP", MarketplaceVisible: true}, Digest: digest}
+	source := workflowMCPSource(digest)
 	installed, err := db.InstallTenantMCP(ctx, access, project.SpaceID, source, archive, 0)
 	if err != nil {
 		t.Fatal(err)
@@ -278,19 +363,11 @@ func TestRealWorkflowMCPLifecycleGate(t *testing.T) {
 		}
 	}
 	run, attempts := awaitRun(runID)
-	blocked := node(attempts, "a")
-	var blockedPayload struct {
-		Detail struct {
-			Code          string `json:"code"`
-			AutoRetryable *bool  `json:"auto_retryable"`
-		} `json:"error_detail"`
+	selectedNode := node(attempts, "a")
+	if run.Status != store.WorkflowStatusSucceeded || selectedNode.Output == nil || !strings.Contains(*selectedNode.Output, "MCP_SETTINGS_RECEIVED") {
+		t.Fatalf("workflow did not reach the authorized MCP: run=%s node=%s", run.Status, selectedNode.Status)
 	}
-	if err := json.Unmarshal(blocked.Payload, &blockedPayload); err != nil {
-		t.Fatal(err)
-	}
-	if run.Status != store.WorkflowStatusFailed || blockedPayload.Detail.Code != "mcp_lifecycle_not_ready" || blockedPayload.Detail.AutoRetryable == nil || *blockedPayload.Detail.AutoRetryable || provider.calls.Load() != 0 || blocked.SessionID != nil || node(attempts, "b").SessionID != nil {
-		t.Fatalf("Controller must reject nonempty MCP before creating a session: run=%s detail=%+v calls=%d", run.Status, blockedPayload.Detail, provider.calls.Load())
-	}
+	assertPublicRecords(selectedNode)
 	// Explicitly disabling both bindings leaves the old Node path usable, including
 	// the shared-checkout handoff between the two real Agent sessions.
 	disabled := strings.Replace(graph, `"enabled":true`, `"enabled":false`, 1)
@@ -311,6 +388,105 @@ func TestRealWorkflowMCPLifecycleGate(t *testing.T) {
 	}
 	// A later run must recheck configuration, fail before starting the Agent, and retain
 	// identifiers that let the operator repair the setting without exposing its old value.
+	t.Run("admitted driver refreshes the same execution", func(t *testing.T) {
+		selected, err := db.ResolveWorkflowMCP(ctx, scope, project.ID, []string{installed.ID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		session := execution.Session{ID: "real-mcp-lifecycle", WorkspaceID: "real-mcp-checkout", Target: &execution.Target{ProjectID: project.ID}, MCP: selected,
+			Executor: &execution.Executor{ID: "opencode:fixture", AgentID: "official/ora-space.opencode", PluginVersion: "0.6.11", Model: model.Model}}
+		defer func() {
+			if err := driver.End(ctx, session.ID); err != nil {
+				t.Error(err)
+			}
+		}()
+		for i, answer := range []string{"MCP_SETTINGS_RECEIVED", "MCP_SETTINGS_UPDATED"} {
+			id := fmt.Sprintf("lifecycle-%d", i)
+			turn := execution.Turn{Ref: execution.Ref{SessionID: session.ID, TurnID: id}, Caller: execution.Caller{Kind: execution.CallerWorkflow, ID: "live-mcp", NodeID: "agent", AttemptID: id}, Prompt: execution.TextPrompt("Use the selected MCP probe.")}
+			if i == 0 {
+				turn, err = db.AdmitExecutionSession(ctx, scope, session, turn, false)
+			} else {
+				turn, err = db.AdmitExecutionTurn(ctx, scope, session.ID, turn, false)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result execution.Result
+			if i == 0 {
+				pause := &mcpModelPause{make(chan struct{}), make(chan struct{})}
+				provider.pause.Store(pause)
+				done := make(chan struct{})
+				go func() {
+					defer close(done)
+					result, err = driver.Run(ctx, scope, session, turn, func(context.Context, execution.Event) error { return nil })
+				}()
+				func() {
+					defer close(pause.resume)
+					select {
+					case <-pause.entered:
+					case <-done:
+						t.Fatal("turn ended before model barrier")
+					case <-ctx.Done():
+						t.Fatal(ctx.Err())
+					}
+					var saveErr error
+					configured, saveErr = db.SetTenantMCPSettings(ctx, access, project.SpaceID, installed.ID, configured.Revision, map[string]any{"token": "changed-fixture-token"}, nil)
+					if saveErr != nil {
+						t.Fatal(saveErr)
+					}
+					deadline := time.Now().Add(15 * time.Second)
+					for {
+						view, readErr := db.ReadSessionMCPStatus(ctx, scope, session.ID)
+						if readErr == nil {
+							readErr = driver.ObserveSessionMCP(ctx, scope, session.ID, &view, "")
+						}
+						if readErr != nil {
+							t.Fatal(readErr)
+						}
+						if view.Active != nil && *view.Active == 0 && view.Generation != nil && *view.Generation == 1 && (view.Convergence == "pending" || view.Convergence == "refreshing") {
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Fatalf("busy turn did not retain its original ACP revision: %+v", view)
+						}
+						time.Sleep(100 * time.Millisecond)
+					}
+				}()
+				<-done
+			} else {
+				result, err = driver.Run(ctx, scope, session, turn, func(context.Context, execution.Event) error { return nil })
+			}
+			if err != nil || result.Status != execution.StatusCompleted || !strings.Contains(result.Answer, answer) {
+				t.Fatalf("turn %d: status=%s code=%s expected fixture response=%t err=%v", i, result.Status, result.FailureCode, strings.Contains(result.Answer, answer), err)
+			}
+			if _, err := db.FinishExecutionTurn(ctx, scope, turn.Ref, result); err != nil {
+				t.Fatal(err)
+			}
+			readStatus := func(probe string) execution.SessionMCPStatus {
+				t.Helper()
+				view, err := db.ReadSessionMCPStatus(ctx, scope, session.ID)
+				if err == nil {
+					err = driver.ObserveSessionMCP(ctx, scope, session.ID, &view, probe)
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				return view
+			}
+			readStatus(installed.ID)
+			deadline := time.Now().Add(15 * time.Second)
+			for {
+				view := readStatus("")
+				if view.Active != nil && *view.Active == 1 && view.Convergence == "current" && len(view.Members) == 1 && view.Members[0].Health == "healthy" && !view.Members[0].InFlight && !view.Members[0].Cleanup {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatalf("generation %d never became delivered and healthy: %+v", i, view)
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	})
 	if _, err := db.SetTenantMCPSettings(ctx, access, project.SpaceID, installed.ID, configured.Revision, nil, []string{"token"}); err != nil {
 		t.Fatal(err)
 	}

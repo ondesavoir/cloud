@@ -61,6 +61,7 @@ export function McpSettings({ installation, tenantId, spaceId, canManage }: {
       save.reset()
     },
   })
+  if (installation.settingsUnavailable) return <p role="status">服务暂时无法解密此插件的设置，请管理员检查部署密钥。</p>
   const pending = save.isPending || reload.isPending
   const change = (id: string, value: string) => {
     setEditRevision((current) => current ?? installation.revision)

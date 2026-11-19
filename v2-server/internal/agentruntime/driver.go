@@ -43,6 +43,7 @@ type Options struct {
 	Bindings        map[string]nodeservices.Binding
 	ObserveProvider func(execution.Ref, nodeservices.Binding) nodeservices.Provider
 	ResolveProject  func(context.Context, execution.Scope, string) (Project, error)
+	ReadMCPTarget   func(context.Context, execution.Scope, string, *execution.MCPSelection, int64) (*execution.MCPTarget, error)
 	// UserSkills returns the caller's live skill catalog. Nil skips user-skill projection.
 	UserSkills func(context.Context, execution.Scope) ([]UserSkill, error)
 	// RecordWorkspace remembers where a workspace's checkout is, once it is ready and before the
@@ -168,6 +169,11 @@ func (d *Driver) run(ctx context.Context, scope execution.Scope, session executi
 	if session.EndedAt != nil {
 		return failed("agent_session_ended"), execution.ErrSessionEnded
 	}
+	// History handoff starts a different provider session. Once this lifecycle's
+	// Node is physically gone, it cannot establish delivery on the original one.
+	if session.Recovery != nil && (turn.MCPGeneration != nil || session.MCP != nil && len(session.MCP.Bindings) != 0) {
+		return failed(execution.FailureNodeLost), execution.ErrNodeLost
+	}
 	text, err := turn.Prompt.Text()
 	if err != nil || len(text) > 64*1024 {
 		return failed("agent_request_invalid"), execution.ErrInvalidRequest
@@ -207,9 +213,16 @@ func (d *Driver) run(ctx context.Context, scope execution.Scope, session executi
 		return failed("agent_prepare_failed"), err
 	}
 	a.commandMu.Lock()
-	call, fresh, err := a.begin(turn.Ref.TurnID, emit)
+	call, fresh, err := a.begin(turn.Ref.TurnID, session.MCP, emit)
 	if err != nil {
 		a.commandMu.Unlock()
+		var failure *execution.MCPFailure
+		if errors.As(err, &failure) {
+			a.requestEnd()
+			result := failed(failure.Code)
+			result.MCPFailure, result.AgentLost = failure, true
+			return result, failure
+		}
 		if errors.Is(err, execution.ErrNodeLost) {
 			return failed(execution.FailureNodeLost), err
 		}
@@ -221,7 +234,7 @@ func (d *Driver) run(ctx context.Context, scope execution.Scope, session executi
 		a.timing = timing
 		a.mu.Unlock()
 	}
-	err = a.submit(turn.Ref.TurnID, text, fresh)
+	err = a.submit(turn, text, fresh)
 	a.commandMu.Unlock()
 	if err != nil {
 		code := "agent_dispatch_failed"
@@ -235,21 +248,28 @@ func (d *Driver) run(ctx context.Context, scope execution.Scope, session executi
 		a.fail(code, err)
 		a.requestEnd()
 	}
-	select {
-	case outcome := <-call.done:
-		if turn.Caller.Kind == execution.CallerChat && outcome.err == nil {
-			a.project.mu.Lock()
-			a.project.fillSpareLocked(project)
-			a.project.mu.Unlock()
-		}
-		return outcome.result, outcome.err
-	case <-ctx.Done():
-		result, err := d.cancelledRun(session.ID, ctx.Err())
+	for {
 		select {
 		case outcome := <-call.done:
+			if turn.Caller.Kind == execution.CallerChat && outcome.err == nil {
+				a.project.mu.Lock()
+				a.project.fillSpareLocked(project)
+				a.project.mu.Unlock()
+			}
 			return outcome.result, outcome.err
-		default:
-			return result, err
+		case <-call.updateRequired:
+			if err := a.reconcileTurn(ctx, call, turn, text); err != nil {
+				a.fail("mcp_update_failed", err)
+				a.requestEnd()
+			}
+		case <-ctx.Done():
+			result, err := d.cancelledRun(session.ID, ctx.Err())
+			select {
+			case outcome := <-call.done:
+				return outcome.result, outcome.err
+			default:
+				return result, err
+			}
 		}
 	}
 }

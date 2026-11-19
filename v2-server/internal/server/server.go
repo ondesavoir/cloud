@@ -95,7 +95,10 @@ type Options struct {
 	Projects *projectrepos.Service
 	// Execution is the shared backend for page-owned conversations and runs.
 	// Nil uses an unavailable Stub; an explicitly supplied backend is kept unchanged.
-	Execution execution.Service
+	Execution  execution.Service
+	SessionMCP interface {
+		ObserveSessionMCP(context.Context, execution.Scope, string, *execution.SessionMCPStatus, string) error
+	}
 	// Catalog exposes the executable Agent/model choices from that backend.
 	// Nil uses an unavailable Stub, independently of Execution.
 	Catalog execution.Catalog
@@ -252,6 +255,8 @@ func newRouter(h *handler) *router {
 	rt.tenant("GET /api/v2/tenants/{tid}/workflow-runs/{rid}/nodes", h.listWorkflowRunNodes)
 	rt.tenant("GET /api/v2/tenants/{tid}/workflow-runs/{rid}/events", h.workflowRunEvents)
 	rt.tenant("GET /api/v2/tenants/{tid}/workflow-runs/{rid}/nodes/{nodeRunId}/events", h.workflowNodeEvents)
+	rt.tenant("GET /api/v2/tenants/{tid}/workflow-runs/{rid}/nodes/{nodeRunId}/mcp", h.workflowNodeMCP)
+	rt.tenant("POST /api/v2/tenants/{tid}/workflow-runs/{rid}/nodes/{nodeRunId}/mcp/probe", h.workflowNodeMCP)
 	h.chatRoutes(rt)
 	h.dashboardRoutes(rt)
 	h.workspaceRoutes(rt)
