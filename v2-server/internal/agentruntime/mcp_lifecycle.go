@@ -118,8 +118,12 @@ func (r *mcpRevision) matchesSelection(s *execution.MCPSelection) bool {
 // syncMCP checks the committed generation before querying Node and sending an update.
 // A lost reply is reconciled by observation, never by relabelling new values as an old update.
 func (a *agentSession) syncMCP(ctx context.Context, selected *execution.MCPSelection, floor int64) error {
-	a.mcpSync.Lock()
-	defer a.mcpSync.Unlock()
+	select {
+	case a.mcpSync <- struct{}{}:
+		defer func() { <-a.mcpSync }()
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
 	defer cancel()
 	target, err := a.project.driver.opts.ReadMCPTarget(ctx, a.scope, a.frozen.ID, selected, a.mcpDelivered)
@@ -210,7 +214,11 @@ func (r *mcpRevision) matchesTarget(t *execution.MCPTarget) bool {
 	return i == len(t.Configured.Bindings)
 }
 
-func (a *agentSession) reconcileTurn(ctx context.Context, call *activeTurn, turn execution.Turn, text string) error {
+var errMCPRefreshWait = errors.New("mcp_refresh_wait_timeout")
+
+func (a *agentSession) reconcileTurn(ctx context.Context, deadline time.Time, call *activeTurn, turn execution.Turn, text string) error {
+	ctx, cancel := context.WithDeadlineCause(ctx, deadline, errMCPRefreshWait)
+	defer cancel()
 	a.mu.Lock()
 	selected := a.frozen.MCP
 	a.mu.Unlock()
@@ -233,7 +241,7 @@ func (a *agentSession) reconcileTurn(ctx context.Context, call *activeTurn, turn
 		case <-a.stopped:
 			return execution.ErrSessionEnded
 		case <-ctx.Done():
-			return ctx.Err()
+			return context.Cause(ctx)
 		case <-time.After(time.Second):
 		}
 	}
@@ -244,6 +252,9 @@ func (a *agentSession) reconcileTurn(ctx context.Context, call *activeTurn, turn
 	a.mu.Unlock()
 	if !active {
 		return nil
+	}
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
 	}
 	return a.submit(turn, text, false)
 }

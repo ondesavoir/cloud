@@ -32,8 +32,18 @@ func (a *agentSession) prepareMCP(ctx context.Context, selected *execution.MCPSe
 	if err != nil {
 		return err
 	}
-	if target == nil || target.Generation != 0 || !selected.SameMembers(&target.Configured) || len(target.Unavailable) != 0 || len(target.Configured.Packages) != len(selected.Bindings) {
+	if target == nil || target.Generation < 0 || target.Generation > execution.MaxMCPCounter {
 		return execution.ErrConflict
+	}
+	for _, binding := range selected.Bindings {
+		if code := target.Unavailable[binding.PluginID]; code == "mcp_plugin_missing" || code == "mcp_setting_missing" {
+			return &execution.MCPFailure{Code: code, PluginID: binding.PluginID}
+		}
+	}
+	// Node starts at generation zero. Use the latest settings for exactly the
+	// admitted members. The primed watcher then delivers the committed generation.
+	if !selected.SameMembers(&target.Configured) || len(target.Unavailable) != 0 || len(target.Configured.Packages) != len(selected.Bindings) {
+		return &execution.MCPFailure{Code: "mcp_selection_invalid"}
 	}
 	if err := target.Configured.Validate(); err != nil {
 		return err

@@ -66,6 +66,8 @@ Agent 把被切断的模型请求当成网络失败原样重发（OpenCode 0.6.1
 
 包安装帧只携带归档身份与摘要。设置通过 Start 或 Update 的私有帧送入 Node，驱动在首轮派发后只保留选择身份。只读状态与手动探测通过当前 Node 的 incarnation、execution 和 request ID 关联响应。MCP 失败保留稳定 code 以及可选 `plugin_id`、`setting_id`、`transport`，工作流将其映射为可手动恢复、禁止自动重试的配置失败。`TestRealWorkflowMCPLifecycle` 使用本地 stdio MCP 及真实 Node/OpenCode，检查繁忙轮次保留原设置、后续轮次使用新设置和宿主探测结果。
 
+如果从准入到冷启动之间有设置提交，首轮使用所选成员的最新配置，启动后立即同步已提交的 generation；已移除或缺设置的成员在启动前返回对应的配置错误。追加轮收到 `mcp_update_required` 后从第一次拒绝起最多等待 300 秒。超过期限时本轮以 `mcp_refresh_wait_timeout` 结束，会话可继续接收后续轮次。用户主动停止则沿用工作流 Agent 的停止确认流程。
+
 重新加载界面后，状态查询仍使用原会话及其显式选择。若 Node 进程已经丢失，原 provider session 无法用当前协议重新绑定，后续轮次以 `agent_transport_closed` 结束。普通会话沿用已有的历史交接逻辑。
 
 包级 `go vet` / `go test -race` 验证登记恢复、拒绝未知路径和 symlink、保留工作文件、runtime 锁及无效终态不能确认停止。

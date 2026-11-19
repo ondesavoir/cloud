@@ -73,7 +73,7 @@ type agentSession struct {
 	recovered    *recoveredHistory
 	mcpRequests  map[string]chan mcpReply // protected by mu
 	mcpWake      chan struct{}            // coalesces committed changes for this selection
-	mcpSync      sync.Mutex               // serializes desired delivery and refused-command reconciliation
+	mcpSync      chan struct{}            // serializes desired delivery and refused-command reconciliation
 	mcpDelivered int64                    // last desired generation confirmed by this Node incarnation
 }
 
@@ -383,6 +383,7 @@ func (a *agentSession) submit(admitted execution.Turn, text string, fresh bool) 
 			a.mu.Lock()
 			a.frozen.MCP = ids
 			a.mcpWake = make(chan struct{}, 1)
+			a.mcpSync = make(chan struct{}, 1)
 			a.mcpWake <- struct{}{}
 			a.mu.Unlock()
 			go a.followMCP(ids)

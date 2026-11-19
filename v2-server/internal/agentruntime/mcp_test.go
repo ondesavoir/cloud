@@ -11,6 +11,7 @@ import (
 	"errors"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/wanglongan587/cloud/v2-server/internal/execution"
 	"github.com/wanglongan587/cloud/v2-server/internal/node"
@@ -57,6 +58,136 @@ func TestLostMCPSessionCannotRestartWithHistoryHandoff(t *testing.T) {
 	case <-h.created:
 		t.Fatal("a replacement Node was created")
 	default:
+	}
+}
+
+func TestMCPStartReadsChangesCommittedAfterAdmission(t *testing.T) {
+	for _, code := range []string{"", "mcp_plugin_missing", "mcp_setting_missing"} {
+		t.Run("latest/"+code, func(t *testing.T) {
+			h := newIPCHarness(t, nil)
+			ctx := ipcContext(t)
+			session := h.session("cold-start", "workspace")
+			session.MCP = ipcMCP()
+			id := session.MCP.Bindings[0].PluginID
+			h.driver.opts.ReadMCPTarget = func(_ context.Context, _ execution.Scope, _ string, _ *execution.MCPSelection, known int64) (*execution.MCPTarget, error) {
+				if known >= 0 {
+					return nil, nil
+				}
+				if code != "" {
+					return &execution.MCPTarget{Generation: 1, Unavailable: map[string]string{id: code}}, nil
+				}
+				latest := ipcMCP()
+				latest.Bindings[0].Settings["token"] = "changed-before-start"
+				return &execution.MCPTarget{Generation: 1, Configured: *latest}, nil
+			}
+			done := make(chan ipcRunOutcome, 1)
+			go func() {
+				turn := execution.Turn{Ref: execution.Ref{SessionID: session.ID, TurnID: "first"}, Prompt: execution.TextPrompt("first"), MCPGeneration: new(int64)}
+				result, err := h.driver.Run(ctx, h.scope, session, turn, discardIPCEvent)
+				done <- ipcRunOutcome{result, err}
+			}()
+			f := receiveIPC(t, h.created)
+			if code != "" {
+				outcome := receiveIPC(t, done)
+				if outcome.result.MCPFailure == nil || outcome.result.MCPFailure.Code != code || outcome.result.MCPFailure.PluginID != id || !outcome.result.NotStarted {
+					t.Fatal("latest unavailable member lost its startup diagnostic")
+				}
+				return
+			}
+			start := nextIPCCommand(t, f, "start_agent_session")
+			if !bytes.Contains(start.Payload, []byte("changed-before-start")) || bytes.Contains(start.Payload, []byte("MCP_SECRET_MARKER")) {
+				t.Fatal("startup did not use the latest authorized settings")
+			}
+			f.finishTurn(t, start, "first", "done")
+			if outcome := receiveIPC(t, done); outcome.err != nil {
+				t.Fatal(outcome.err)
+			}
+		})
+	}
+}
+
+func TestRefusedMCPTimeoutRetainsSession(t *testing.T) {
+	var refuse atomic.Bool
+	failedRead := make(chan struct{}, 1)
+	h := newIPCHarness(t, func(f *fakeNodeIPC, m node.Message) bool {
+		if m.Type == "submit_user_turn" && refuse.Load() {
+			var command struct {
+				ID string `json:"command_id"`
+			}
+			if err := json.Unmarshal(m.Payload, &command); err != nil {
+				return false
+			}
+			f.reply(m, "session_command_rejected", map[string]string{"command_id": command.ID, "reason": "mcp_update_required"})
+			return true
+		}
+		return false
+	})
+	h.driver.mcpRefreshWait = 50 * time.Millisecond
+	h.driver.opts.ReadMCPTarget = func(ctx context.Context, _ execution.Scope, _ string, _ *execution.MCPSelection, known int64) (*execution.MCPTarget, error) {
+		if known == -1 {
+			return &execution.MCPTarget{Configured: *ipcMCP()}, nil
+		}
+		if refuse.Load() {
+			select {
+			case failedRead <- struct{}{}:
+			default:
+			}
+			return nil, execution.ErrUnavailable
+		}
+		return nil, nil
+	}
+	ctx := ipcContext(t)
+	session := h.session("refused-session", "workspace")
+	session.MCP = ipcMCP()
+	run := func(ctx context.Context, id string) <-chan ipcRunOutcome {
+		done := make(chan ipcRunOutcome, 1)
+		go func() {
+			turn := execution.Turn{Ref: execution.Ref{SessionID: session.ID, TurnID: id}, Prompt: execution.TextPrompt(id), MCPGeneration: new(int64)}
+			result, err := h.driver.Run(ctx, h.scope, session, turn, discardIPCEvent)
+			done <- ipcRunOutcome{result, err}
+		}()
+		return done
+	}
+	first := run(ctx, "first")
+	f := receiveIPC(t, h.created)
+	start := nextIPCCommand(t, f, "start_agent_session")
+	f.finishTurn(t, start, "first", "ready")
+	if got := receiveIPC(t, first); got.err != nil {
+		t.Fatal(got.err)
+	}
+	refuse.Store(true)
+	result := receiveIPC(t, run(ctx, "refused"))
+	if result.err != nil || result.result.FailureCode != "mcp_refresh_wait_timeout" || result.result.AgentLost {
+		t.Fatal("refused turn did not time out on its own", result.err, result.result.FailureCode)
+	}
+	// The refused submission is visible on the wire, but never accepted by Node.
+	nextIPCCommand(t, f, "submit_user_turn")
+	refuse.Store(false)
+	last := run(ctx, "next")
+	command := nextIPCCommand(t, f, "submit_user_turn")
+	if command.ExecutionID != start.ExecutionID {
+		t.Fatal("timeout replaced the Agent")
+	}
+	f.finishTurn(t, command, "next", "healthy")
+	if got := receiveIPC(t, last); got.err != nil || got.result.Status != execution.StatusCompleted {
+		t.Fatal("same session could not continue after timeout", got.err)
+	}
+	// An explicit cancellation while waiting must use normal confirmed End,
+	// not publish a synthetic configuration failure.
+	receiveIPC(t, failedRead)
+	h.driver.mcpRefreshWait = time.Minute
+	refuse.Store(true)
+	interrupted, cancel := context.WithCancel(ctx)
+	defer cancel()
+	waiting := run(interrupted, "cancel-me")
+	nextIPCCommand(t, f, "submit_user_turn")
+	receiveIPC(t, failedRead)
+	cancel()
+	end := nextIPCCommand(t, f, "end_session")
+	f.terminal(end)
+	got := receiveIPC(t, waiting)
+	if got.result.Status != execution.StatusCancelled || got.result.FailureCode != "" {
+		t.Fatal("explicit stop became a refresh failure", got.result.Status, got.result.FailureCode)
 	}
 }
 
