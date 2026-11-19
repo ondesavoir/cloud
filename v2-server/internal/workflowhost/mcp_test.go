@@ -41,6 +41,28 @@ func TestMCPLifecycleGateFailuresAreExplicitAndNotRetryable(t *testing.T) {
 	}
 }
 
+func TestStartRefusalRetainsMCPDiagnostic(t *testing.T) {
+	f := newFixture(t)
+	f.exec.beforeStart = func(execution.StartRequest) error {
+		return fmt.Errorf("start: %w", &execution.MCPFailure{Code: "mcp_node_capability_missing"})
+	}
+	rid := f.run(t, twoAgents, str("check"))
+	if _, err := f.host.StartRun(t.Context(), f.scope, rid); err != nil {
+		t.Fatal(err)
+	}
+	_, nodes := f.await(t, rid, terminal)
+	n := node(nodes, "a")
+	var payload struct {
+		Detail map[string]any `json:"error_detail"`
+	}
+	if err := json.Unmarshal(n.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if n.SessionID != nil || payload.Detail["kind"] != "missing_agent_config" || payload.Detail["code"] != "mcp_node_capability_missing" || payload.Detail["auto_retryable"] != false {
+		t.Fatal("Start refusal lost the setup diagnostic", payload.Detail)
+	}
+}
+
 func TestMCPSetupFailureRetainsIdentifiersAndCannotAutoRetry(t *testing.T) {
 	f := newFixture(t)
 	runID := f.run(t, twoAgents, str("check"))

@@ -76,17 +76,20 @@ func executionCaller(caller execution.Caller) ([]byte, error) {
 // Duplicate caller identities return ErrConflict; the runtime resolves retries before dispatch.
 // Session and turn IDs must be server-generated random identities, never caller-selected IDs.
 func (s *Store) CreateExecutionSession(ctx context.Context, scope execution.Scope, session execution.Session, first execution.Turn) error {
-	return s.createExecutionSession(ctx, scope, session, first, false)
+	_, err := s.AdmitExecutionSession(ctx, scope, session, first, false)
+	return err
 }
 
 // CreateDeliveryExecutionSession admits the first turn and enrolls eligible work atomically.
 func (s *Store) CreateDeliveryExecutionSession(ctx context.Context, scope execution.Scope, session execution.Session, first execution.Turn) error {
-	return s.createExecutionSession(ctx, scope, session, first, true)
+	_, err := s.AdmitExecutionSession(ctx, scope, session, first, true)
+	return err
 }
 
-func (s *Store) createExecutionSession(ctx context.Context, scope execution.Scope, session execution.Session, first execution.Turn, deliver bool) error {
+// AdmitExecutionSession returns the committed first turn, including its MCP generation, for dispatch.
+func (s *Store) AdmitExecutionSession(ctx context.Context, scope execution.Scope, session execution.Session, first execution.Turn, deliver bool) (execution.Turn, error) {
 	if session.ID == "" || session.EndedAt != nil || first.Ref.SessionID != session.ID {
-		return execution.ErrInvalidRequest
+		return execution.Turn{}, execution.ErrInvalidRequest
 	}
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := requireExecutionAccess(ctx, tx, scope); err != nil {
@@ -106,22 +109,30 @@ func (s *Store) createExecutionSession(ctx context.Context, scope execution.Scop
 				return err
 			}
 		}
+		target, err := initialMCPTarget(ctx, tx, scope, session, first.Caller.Kind)
+		if err != nil {
+			return err
+		}
 		data, err := json.Marshal(session)
 		if err != nil {
 			return err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO v2_execution_sessions(id,tenant_id,user_id,data) VALUES($1,$2,$3,$4)`, session.ID, scope.TenantID, scope.UserID, data); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO v2_execution_sessions(id,tenant_id,user_id,data,mcp_target,mcp_generation)
+			VALUES($1,$2,$3,$4,$5,CASE WHEN $5::jsonb IS NOT NULL THEN 0 END)`, session.ID, scope.TenantID, scope.UserID, data, target); err != nil {
 			return err
 		}
-		if err := insertExecutionTurn(ctx, tx, scope, session.ID, first); err != nil || !deliver {
+		if err := insertExecutionTurn(ctx, tx, scope, session.ID, &first); err != nil || !deliver {
 			return err
 		}
 		return enrollDelivery(ctx, tx, scope, session, first)
 	})
-	return executionError(err)
+	if err != nil {
+		return execution.Turn{}, executionError(err)
+	}
+	return first, nil
 }
 
-func insertExecutionTurn(ctx context.Context, tx pgx.Tx, scope execution.Scope, sid string, turn execution.Turn) error {
+func insertExecutionTurn(ctx context.Context, tx pgx.Tx, scope execution.Scope, sid string, turn *execution.Turn) error {
 	if turn.Ref.SessionID != sid || turn.Ref.TurnID == "" || turn.Result != nil || turn.EndedAt != nil {
 		return execution.ErrInvalidRequest
 	}
@@ -134,7 +145,7 @@ func insertExecutionTurn(ctx context.Context, tx pgx.Tx, scope execution.Scope, 
 	}
 	var position int64
 	var now time.Time
-	if err := tx.QueryRow(ctx, `UPDATE v2_execution_sessions SET turn_position=turn_position+1 WHERE id=$1 RETURNING turn_position,now()`, sid).Scan(&position, &now); err != nil {
+	if err := tx.QueryRow(ctx, `UPDATE v2_execution_sessions SET turn_position=turn_position+1 WHERE id=$1 RETURNING turn_position,now(),mcp_generation`, sid).Scan(&position, &now, &turn.MCPGeneration); err != nil {
 		return err
 	}
 	if turn.StartedAt.IsZero() {
@@ -151,15 +162,19 @@ func insertExecutionTurn(ctx context.Context, tx pgx.Tx, scope execution.Scope, 
 // AppendExecutionTurn records a new turn only while the owning session remains live.
 // TurnID must be a fresh server-generated random identity.
 func (s *Store) AppendExecutionTurn(ctx context.Context, scope execution.Scope, sid string, turn execution.Turn) error {
-	return s.appendExecutionTurn(ctx, scope, sid, turn, false)
+	_, err := s.AdmitExecutionTurn(ctx, scope, sid, turn, false)
+	return err
 }
 
 // AppendDeliveryExecutionTurn admits a follow-up and enrolls eligible work atomically.
 func (s *Store) AppendDeliveryExecutionTurn(ctx context.Context, scope execution.Scope, sid string, turn execution.Turn) error {
-	return s.appendExecutionTurn(ctx, scope, sid, turn, true)
+	_, err := s.AdmitExecutionTurn(ctx, scope, sid, turn, true)
+	return err
 }
 
-func (s *Store) appendExecutionTurn(ctx context.Context, scope execution.Scope, sid string, turn execution.Turn, deliver bool) error {
+// AdmitExecutionTurn returns the committed follow-up so dispatch uses the generation from
+// the same transaction as the turn, even if another settings save has already committed.
+func (s *Store) AdmitExecutionTurn(ctx context.Context, scope execution.Scope, sid string, turn execution.Turn, deliver bool) (execution.Turn, error) {
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := requireExecutionAccess(ctx, tx, scope); err != nil {
 			return err
@@ -171,12 +186,15 @@ func (s *Store) appendExecutionTurn(ctx context.Context, scope execution.Scope, 
 		if session.EndedAt != nil {
 			return execution.ErrSessionEnded
 		}
-		if err := insertExecutionTurn(ctx, tx, scope, sid, turn); err != nil || !deliver {
+		if err := insertExecutionTurn(ctx, tx, scope, sid, &turn); err != nil || !deliver {
 			return err
 		}
 		return enrollDelivery(ctx, tx, scope, session, turn)
 	})
-	return executionError(err)
+	if err != nil {
+		return execution.Turn{}, executionError(err)
+	}
+	return turn, nil
 }
 
 // Only runtime updates to admitted work use this boundary. Revoking access must not

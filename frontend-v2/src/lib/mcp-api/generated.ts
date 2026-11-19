@@ -64,6 +64,7 @@ export interface McpInstallation {
   configuredSecrets: string[];
   complete: boolean;
   settingsMissing: string[];
+  settingsUnavailable?: boolean;
 }
 
 export type McpSettingsInputValues = {[key: string]: string | number | boolean};
@@ -100,6 +101,54 @@ export interface McpError {
   code: string;
   params: McpErrorParams;
   requestId: string;
+}
+
+export type SessionMcpMemberHealth = typeof SessionMcpMemberHealth[keyof typeof SessionMcpMemberHealth];
+
+
+export const SessionMcpMemberHealth = {
+  unknown: 'unknown',
+  healthy: 'healthy',
+  unhealthy: 'unhealthy',
+} as const;
+
+export interface SessionMcpMember {
+  id: string;
+  configured: boolean;
+  version?: string;
+  revision?: number;
+  code?: string;
+  health: SessionMcpMemberHealth;
+  queued?: boolean;
+  inFlight?: boolean;
+  cleanupPending?: boolean;
+}
+
+export type SessionMcpStatusConvergence = typeof SessionMcpStatusConvergence[keyof typeof SessionMcpStatusConvergence];
+
+
+export const SessionMcpStatusConvergence = {
+  unknown: 'unknown',
+  ended: 'ended',
+  stopping: 'stopping',
+  current: 'current',
+  pending: 'pending',
+  blocked: 'blocked',
+  refreshing: 'refreshing',
+} as const;
+
+export interface SessionMcpStatus {
+  generation?: number;
+  activeGeneration?: number;
+  convergence: SessionMcpStatusConvergence;
+  probeCapacityAvailable?: boolean;
+  canProbe: boolean;
+  members: SessionMcpMember[];
+}
+
+export interface SessionMcpProbe {
+  pluginId: string;
+  generation: number;
 }
 
 type SecondParameter<T extends (...args: never) => unknown> = Parameters<T>[1];
@@ -398,4 +447,170 @@ const {mutation: mutationOptions, request: requestOptions} = options ?
         TContext
       > => {
       return useMutation(getUpdateMcpSettingsMutationOptions(options), queryClient);
+    }
+
+export const getWorkflowSessionMcp = (
+    tid: string,
+    rid: string,
+    nodeRunId: string,
+ options?: SecondParameter<typeof customInstance>,signal?: AbortSignal
+) => {
+
+
+      return customInstance<SessionMcpStatus>(
+      {url: `/api/v2/tenants/${tid}/workflow-runs/${rid}/nodes/${nodeRunId}/mcp`, method: 'GET', signal
+    },
+      options);
+    }
+
+
+
+
+export const getGetWorkflowSessionMcpQueryKey = (tid: string,
+    rid: string,
+    nodeRunId: string,) => {
+    return [
+    `/api/v2/tenants/${tid}/workflow-runs/${rid}/nodes/${nodeRunId}/mcp`
+    ] as const;
+    }
+
+
+export const getGetWorkflowSessionMcpQueryOptions = <TData = Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError = ErrorType<McpError>>(tid: string,
+    rid: string,
+    nodeRunId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError, TData>>, request?: SecondParameter<typeof customInstance>}
+) => {
+
+const {query: queryOptions, request: requestOptions} = options ?? {};
+
+  const queryKey =  queryOptions?.queryKey ?? getGetWorkflowSessionMcpQueryKey(tid,rid,nodeRunId);
+
+
+
+    const queryFn: QueryFunction<Awaited<ReturnType<typeof getWorkflowSessionMcp>>> = ({ signal }) => getWorkflowSessionMcp(tid,rid,nodeRunId, requestOptions, signal);
+
+
+
+
+
+   return  { queryKey, queryFn, enabled: tid !== null && tid !== undefined && rid !== null && rid !== undefined && nodeRunId !== null && nodeRunId !== undefined, ...queryOptions} as UseQueryOptions<Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError, TData> & { queryKey: DataTag<QueryKey, TData, TError> }
+}
+
+export type GetWorkflowSessionMcpQueryResult = NonNullable<Awaited<ReturnType<typeof getWorkflowSessionMcp>>>
+export type GetWorkflowSessionMcpQueryError = ErrorType<McpError>
+
+
+export function useGetWorkflowSessionMcp<TData = Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError = ErrorType<McpError>>(
+ tid: string,
+    rid: string,
+    nodeRunId: string, options: { query:Partial<UseQueryOptions<Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError, TData>> & Pick<
+        DefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getWorkflowSessionMcp>>,
+          TError,
+          Awaited<ReturnType<typeof getWorkflowSessionMcp>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customInstance>}
+ , queryClient?: QueryClient
+  ):  DefinedUseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetWorkflowSessionMcp<TData = Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError = ErrorType<McpError>>(
+ tid: string,
+    rid: string,
+    nodeRunId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError, TData>> & Pick<
+        UndefinedInitialDataOptions<
+          Awaited<ReturnType<typeof getWorkflowSessionMcp>>,
+          TError,
+          Awaited<ReturnType<typeof getWorkflowSessionMcp>>
+        > , 'initialData'
+      >, request?: SecondParameter<typeof customInstance>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+export function useGetWorkflowSessionMcp<TData = Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError = ErrorType<McpError>>(
+ tid: string,
+    rid: string,
+    nodeRunId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError, TData>>, request?: SecondParameter<typeof customInstance>}
+ , queryClient?: QueryClient
+  ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> }
+
+export function useGetWorkflowSessionMcp<TData = Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError = ErrorType<McpError>>(
+ tid: string,
+    rid: string,
+    nodeRunId: string, options?: { query?:Partial<UseQueryOptions<Awaited<ReturnType<typeof getWorkflowSessionMcp>>, TError, TData>>, request?: SecondParameter<typeof customInstance>}
+ , queryClient?: QueryClient
+ ):  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> } {
+
+  const queryOptions = getGetWorkflowSessionMcpQueryOptions(tid,rid,nodeRunId,options)
+
+  const query = useQuery(queryOptions, queryClient) as  UseQueryResult<TData, TError> & { queryKey: DataTag<QueryKey, TData, TError> };
+
+  return withQueryKey(query, queryOptions.queryKey);
+}
+
+
+
+
+
+
+
+export const probeWorkflowSessionMcp = (
+    tid: string,
+    rid: string,
+    nodeRunId: string,
+    sessionMcpProbe: BodyType<SessionMcpProbe>,
+ options?: SecondParameter<typeof customInstance>,signal?: AbortSignal
+) => {
+
+
+      return customInstance<void>(
+      {url: `/api/v2/tenants/${tid}/workflow-runs/${rid}/nodes/${nodeRunId}/mcp/probe`, method: 'POST',
+      headers: {'Content-Type': 'application/json', },
+      data: sessionMcpProbe, signal
+    },
+      options);
+    }
+
+
+
+
+export const getProbeWorkflowSessionMcpMutationKey = () => ['probeWorkflowSessionMcp'] as const;
+
+export const getProbeWorkflowSessionMcpMutationOptions = <TError = ErrorType<McpError>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof probeWorkflowSessionMcp>>, TError,ProbeWorkflowSessionMcpMutationVariables, TContext>, request?: SecondParameter<typeof customInstance>}
+): UseMutationOptions<Awaited<ReturnType<typeof probeWorkflowSessionMcp>>, TError,ProbeWorkflowSessionMcpMutationVariables, TContext> => {
+
+const mutationKey = getProbeWorkflowSessionMcpMutationKey();
+const {mutation: mutationOptions, request: requestOptions} = options ?
+      options.mutation && 'mutationKey' in options.mutation && options.mutation.mutationKey ?
+      options
+      : {...options, mutation: {...options.mutation, mutationKey}}
+      : {mutation: { mutationKey, }, request: undefined};
+
+
+
+
+      const mutationFn: MutationFunction<Awaited<ReturnType<typeof probeWorkflowSessionMcp>>, ProbeWorkflowSessionMcpMutationVariables> = (props) => {
+          const {tid,rid,nodeRunId,data} = props ?? {};
+
+          return  probeWorkflowSessionMcp(tid,rid,nodeRunId,data,requestOptions)
+        }
+
+
+
+
+
+
+  return  { mutationFn, ...mutationOptions }}
+
+    export type ProbeWorkflowSessionMcpMutationResult = NonNullable<Awaited<ReturnType<typeof probeWorkflowSessionMcp>>>
+    export type ProbeWorkflowSessionMcpMutationBody = BodyType<SessionMcpProbe>
+    export type ProbeWorkflowSessionMcpMutationError = ErrorType<McpError>
+    export type ProbeWorkflowSessionMcpMutationVariables = {tid: string;rid: string;nodeRunId: string;data: BodyType<SessionMcpProbe>}
+
+    export const useProbeWorkflowSessionMcp = <TError = ErrorType<McpError>,
+    TContext = unknown>(options?: { mutation?:UseMutationOptions<Awaited<ReturnType<typeof probeWorkflowSessionMcp>>, TError,ProbeWorkflowSessionMcpMutationVariables, TContext>, request?: SecondParameter<typeof customInstance>}
+ , queryClient?: QueryClient): UseMutationResult<
+        Awaited<ReturnType<typeof probeWorkflowSessionMcp>>,
+        TError,
+        ProbeWorkflowSessionMcpMutationVariables,
+        TContext
+      > => {
+      return useMutation(getProbeWorkflowSessionMcpMutationOptions(options), queryClient);
     }

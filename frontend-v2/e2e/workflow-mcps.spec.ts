@@ -1,13 +1,16 @@
 import { expect, test, type Page } from '@playwright/test'
-import { signIn } from './login.ts'
+import { execFileSync } from 'node:child_process'
+import { fileURLToPath } from 'node:url'
+import { signIn, signInAsInvitedMember } from './login.ts'
 
 /** Executes one explicit selection through the real workflow host, with retry enabled. */
-async function startMcpRun(page: Page, base: string, executor: { agentId: string; modelId: string }, mcpId: string, title: string) {
+async function startMcpRun(page: Page, base: string, executor: { agentId: string; modelId: string }, mcpId: string, title: string, interactive = false) {
   const graph = JSON.stringify({
     nodes: [
       { id: 'start', type: 'workflow', position: { x: 0, y: 0 }, data: { kind: 'start', title: '开始' } },
       { id: 'agent', type: 'workflow', position: { x: 320, y: 0 }, data: { kind: 'agent', title, agentConfig: {
         executor: { agentCli: executor.agentId, modelId: executor.modelId }, prompt: 'Reply with a short greeting.',
+        interactive,
         retry: { enabled: true, maxRetries: 2, initialDelaySeconds: 0 },
         mcps: [{ mcpId, enabled: true }],
       } } },
@@ -136,7 +139,7 @@ test('an enabled unavailable MCP fails with actionable diagnostics', async ({ pa
   await page.screenshot({ path: info.outputPath('1201-mcp-failure.png'), animations: 'disabled' })
 })
 
-test('the Controller rejects a configured MCP before creating a session', async ({ page }, info) => {
+test('a live workflow session preserves the explicit MCP selection after reload', async ({ page, browser, baseURL }, info) => {
   test.setTimeout(180_000)
   await page.setViewportSize({ width: 1600, height: 1000 })
   await page.goto('/settings/plugins')
@@ -146,16 +149,19 @@ test('the Controller rejects a configured MCP before creating a session', async 
   const base = `/api/v2/tenants/${tid}`
   const executors = (await (await page.request.get(`${base}/chat/executors`)).json()).items
   test.skip(executors.length === 0, 'prepared Node assets are required for the Agent executor catalog')
-  // The pinned Node supports session_mcp_lifecycle, but the Controller lifecycle adapter is
-  // still gated. Keep rejecting before session creation until that adapter is implemented.
-  const identifier = 'official/ora-space.tavily-search'
+  test.skip(process.env.E2E_EXTERNAL_SERVERS === '1', 'the local stdio fixture requires the isolated Playwright database')
+  const identifier = 'official/fixture.workflow-mcp'
   const mcpPath = `/api/v1/tenants/${tid}/spaces/${sid}/mcp`
   const list = async () => (await (await page.request.get(`/api/v1/tenants/${tid}/mcp`)).json()).items
   let installation = (await list()).find((item: { id: string }) => item.id === identifier)
   if (!installation) {
-    const installed = await page.request.post(mcpPath, { data: { identifier, revision: 0 } })
-    expect(installed.status(), await installed.text()).toBe(200)
-    installation = (await installed.json()).resource
+    const me = await (await page.request.get('/api/v1/me')).json()
+    execFileSync('go', ['test', '-count=1', '-run', '^TestInstallBrowserMCPFixture$', './internal/workflowhost'], {
+      cwd: fileURLToPath(new URL('../../v2-server/', import.meta.url)),
+      env: { ...process.env, E2E_MCP_FIXTURE_TENANT: tid, E2E_MCP_FIXTURE_SPACE: sid, E2E_MCP_FIXTURE_USER: me.id,
+        E2E_DATABASE_URL: process.env.E2E_DATABASE_URL ?? 'postgres://ora:ora-local@127.0.0.1:55432/ora_v2_e2e?sslmode=disable' },
+    })
+    installation = (await list()).find((item: { id: string }) => item.id === identifier)
   }
   expect(installation.state).toBe('installed')
   const secretIds = installation.settings.filter((setting: { secret: boolean }) => setting.secret).map((setting: { id: string }) => setting.id)
@@ -168,24 +174,49 @@ test('the Controller rejects a configured MCP before creating a session', async 
   expect(saved.configuredSecrets).toEqual(secretIds)
   expect(JSON.stringify(saved)).not.toContain('mcp-e2e-lifecycle-fixture-token')
 
+  let rid = ''
   try {
-    const rid = await startMcpRun(page, base, executors[0], identifier, '已配置 MCP 的生命周期门禁')
+    const executor = executors.find((e: { modelId: string; agentId: string }) => e.modelId === 'fixture' && e.agentId === 'official/ora-space.opencode')
+    expect(executor).toBeDefined()
+    rid = await startMcpRun(page, base, executor, identifier, '会话 MCP 状态', true)
+    const sessionPanel = async () => {
+      const pane = page.getByRole('region', { name: '工作流运行' })
+      await pane.locator('[data-path-node="agent"]').click()
+      await pane.getByRole('button', { name: '查看节点会话' }).click()
+      return pane.getByRole('region', { name: '会话 MCP' })
+    }
     const detail = async () => (await page.request.get(`${base}/workflow-runs/${rid}`)).json()
-    await expect.poll(async () => (await detail()).run.status, { timeout: 120_000 }).toBe('failed')
-    const result = await detail()
-    const node = result.nodes.find((item: { nodeId: string }) => item.nodeId === 'agent')
-    const failure = JSON.parse(node.payload).error_detail
-    expect(failure).toMatchObject({ code: 'mcp_lifecycle_not_ready', auto_retryable: false, attempt: 1 })
-    expect(failure.plugin_id).toBeUndefined()
-    expect(failure.transport).toBeUndefined()
-    expect(node.sessionId).toBeNull()
-    expect(JSON.stringify(result)).not.toContain('mcp-e2e-lifecycle-fixture-token')
-    const diagnostics = await openMcpFailure(page, rid, '已配置 MCP 的生命周期门禁')
-    await expect(diagnostics).toContainText('mcp_lifecycle_not_ready')
-    await expect(diagnostics).toContainText('当前服务尚未支持 MCP 生命周期，暂时无法运行带 MCP 的节点。')
-    await expect(diagnostics).not.toContainText('mcp_plugin_missing')
-    await page.screenshot({ path: info.outputPath('1201-mcp-lifecycle.png'), animations: 'disabled' })
+    await expect.poll(async () => (await detail()).run.status, { timeout: 120_000 }).toBe('awaitingInput')
+    await page.goto(`/chat?run=${rid}`)
+    let panel = await sessionPanel()
+    await expect(panel).toContainText(identifier)
+    await expect(panel).toContainText('当前配置已送达')
+    await page.reload()
+    panel = await sessionPanel()
+    await expect(panel).toContainText(identifier)
+    await expect(panel).toContainText('宿主健康')
+    await expect(panel).not.toContainText('mcp-e2e-lifecycle-fixture-token')
+    const probing = page.waitForResponse(r => r.request().method() === 'POST' && r.url().endsWith('/mcp/probe'))
+    await panel.getByRole('button', { name: '重新探测' }).click()
+    expect((await probing).status()).toBe(202)
+    await expect(panel).toContainText('宿主健康：健康')
+    const agentNode = (await detail()).nodes.find((n: { nodeId: string }) => n.nodeId === 'agent')
+    const statusPath = `${base}/workflow-runs/${rid}/nodes/${agentNode.id}/mcp`
+    const member = await browser.newPage({ baseURL })
+    try {
+      await signInAsInvitedMember(member)
+      const view = await member.request.get(statusPath)
+      expect(view.status()).toBe(200)
+      expect(await view.json()).toMatchObject({ canProbe: false, members: [{ id: identifier }] })
+      expect((await member.request.post(statusPath + '/probe', { data: { pluginId: identifier, generation: 0 } })).status()).toBe(403)
+    } finally {
+      await member.close()
+    }
+    await expect(panel.getByRole('button', { name: '重新探测' })).toBeEnabled()
+    await expect(panel).toContainText('宿主健康：健康')
+    await page.screenshot({ path: info.outputPath('1199-session-mcp.png'), animations: 'disabled' })
   } finally {
+    if (rid) await page.request.post(`${base}/workflow-runs/${rid}/cancel`)
     expect((await page.request.delete(mcpPath, { data: { identifier, revision: saved.revision } })).ok()).toBe(true)
   }
 })

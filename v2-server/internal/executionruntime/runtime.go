@@ -131,7 +131,7 @@ type Service struct {
 var _ execution.Service = (*Service)(nil)
 var _ execution.Catalog = (*Service)(nil)
 
-// New closes old persisted sessions before admitting work. Models may be empty when the
+// New reconciles persisted executions and reserves the workspaces of surviving held sessions. Models may be empty when the
 // deployment has no real provider, leaving the catalog empty until one is configured. Node
 // process recovery belongs to AgentDriver initialization; callers must construct that driver
 // before exposing this service.
@@ -226,11 +226,13 @@ func (s *Service) Start(ctx context.Context, scope execution.Scope, req executio
 	if err := req.MCP.Validate(); err != nil {
 		return execution.Ref{}, err
 	}
-	// Controller generation admission and lifecycle events are not implemented yet. Reject
-	// before copying packages, stopping an idle predecessor, or persisting a Session/Turn.
-	// The driver's independent Node capability gate remains defense in depth.
+	// Drivers without a lifecycle configuration source cannot consume admitted targets.
+	// The real driver checks the connected Node's capabilities before any Agent preparation.
 	if req.MCP != nil && len(req.MCP.Bindings) != 0 {
-		return execution.Ref{}, &execution.MCPFailure{Code: "mcp_lifecycle_not_ready"}
+		live, ok := s.agent.(interface{ SupportsMCPLifecycle() bool })
+		if !ok || !live.SupportsMCPLifecycle() {
+			return execution.Ref{}, &execution.MCPFailure{Code: "mcp_lifecycle_not_ready"}
+		}
 	}
 	req.MCP = req.MCP.Clone()
 	return s.start(ctx, scope, req.Caller, req.Prompt, &req.Target, req.ExecutorID, req.AgentID, req.ModelID, req.Skills, req.MCP, req.Lifetime)
@@ -271,7 +273,7 @@ func (s *Service) start(ctx context.Context, scope execution.Scope, caller execu
 		if e != nil {
 			return execution.Ref{}, publicError(e)
 		}
-		if !sameJSON(session.MCP, mcp) || !reflect.DeepEqual(session.Skills, skills) || !sameJSON(old.Prompt, prompt) || !reflect.DeepEqual(session.Target, target) || (target == nil && session.Model.ID != modelID) || (target != nil && !sameAgentSelection(session.Executor, executorID, agentID, modelID)) {
+		if !session.MCP.SameMembers(mcp) || !reflect.DeepEqual(session.Skills, skills) || !sameJSON(old.Prompt, prompt) || !reflect.DeepEqual(session.Target, target) || (target == nil && session.Model.ID != modelID) || (target != nil && !sameAgentSelection(session.Executor, executorID, agentID, modelID)) {
 			return execution.Ref{}, execution.ErrConflict
 		}
 		return old.Ref, nil
@@ -322,11 +324,8 @@ func (s *Service) start(ctx context.Context, scope execution.Scope, caller execu
 		}
 	}
 	turn := execution.Turn{Ref: execution.Ref{SessionID: session.ID, TurnID: newID()}, Caller: caller, Prompt: copyPrompt(prompt), StartedAt: time.Now().UTC()}
-	create := s.db.CreateExecutionSession
-	if s.delivery != nil {
-		create = s.db.CreateDeliveryExecutionSession
-	}
-	if err := create(ctx, scope, session, turn); err != nil {
+	turn, err := s.db.AdmitExecutionSession(ctx, scope, session, turn, s.delivery != nil)
+	if err != nil {
 		return execution.Ref{}, publicError(err)
 	}
 	if lifetime == execution.LifetimeHeld {
@@ -456,11 +455,8 @@ func (s *Service) Append(ctx context.Context, scope execution.Scope, req executi
 			continue
 		}
 		turn := execution.Turn{Ref: execution.Ref{SessionID: session.ID, TurnID: newID()}, Caller: req.Caller, Prompt: copyPrompt(req.Prompt), StartedAt: time.Now().UTC()}
-		appendTurn := s.db.AppendExecutionTurn
-		if s.delivery != nil {
-			appendTurn = s.db.AppendDeliveryExecutionTurn
-		}
-		if err := appendTurn(ctx, scope, session.ID, turn); err != nil {
+		turn, err = s.db.AdmitExecutionTurn(ctx, scope, session.ID, turn, s.delivery != nil)
+		if err != nil {
 			return execution.Ref{}, publicError(err)
 		}
 		s.launch(scope, session, turn, group)
@@ -507,6 +503,7 @@ func (s *Service) launch(scope execution.Scope, session execution.Session, turn 
 		var result execution.Result
 		var agentErr error
 		var recovered, nodeLost bool
+		lifecycle := turn.MCPGeneration != nil || session.MCP != nil && len(session.MCP.Bindings) != 0
 		if session.Target != nil {
 			for attempt := 0; ; attempt++ {
 				s.mu.Lock()
@@ -538,7 +535,7 @@ func (s *Service) launch(scope execution.Scope, session execution.Session, turn 
 				}
 				// A held session outlives its Node: like a restart, the Agent's loss leaves the
 				// conversation recorded, and a new Agent continues it on the same checkout.
-				nodeLost = held && result.FailureCode == execution.FailureNodeLost && !s.firstTurn(ctx, scope, turn)
+				nodeLost = held && !lifecycle && result.FailureCode == execution.FailureNodeLost && !s.firstTurn(ctx, scope, turn)
 				if !nodeLost {
 					break
 				}
@@ -567,7 +564,8 @@ func (s *Service) launch(scope execution.Scope, session execution.Session, turn 
 		// A recovered session whose new Agent could not be started keeps waiting for another
 		// turn: nothing ran, and the conversation is still recorded. Only a missing checkout
 		// ends it.
-		retry := nodeLost || (recovered && result.NotStarted && result.FailureCode != execution.FailureWorkspaceMissing)
+		canRecover := result.FailureCode != execution.FailureWorkspaceMissing && !(lifecycle && result.FailureCode == execution.FailureNodeLost)
+		retry := nodeLost || recovered && result.NotStarted && canRecover
 		// An Agent error means the session is gone; the driver marks the results it publishes
 		// itself, and this marks the ones only the runtime writes.
 		result.AgentLost = !retry && (result.AgentLost || agentErr != nil)

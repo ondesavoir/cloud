@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/wanglongan587/cloud/v2-server/internal/execution"
+	"github.com/wanglongan587/cloud/v2-server/internal/pluginmarket"
 	"github.com/wanglongan587/cloud/v2-server/internal/store"
 	"github.com/wanglongan587/cloud/v2-server/internal/store/storetest"
 )
@@ -215,7 +216,7 @@ func TestTenantMCPConfigurationIsSharedSealedAndVersioned(t *testing.T) {
 		t.Fatal("digest was not canonical")
 	}
 	if len(selection.Packages[0].Archive) != 0 {
-		t.Fatal("closed lifecycle gate must not load package archives")
+		t.Fatal("pre-admission resolution must not load package archives")
 	}
 	cancelled, cancel := context.WithCancel(f.ctx)
 	cancel()
@@ -253,9 +254,26 @@ func TestTenantMCPConfigurationIsSharedSealedAndVersioned(t *testing.T) {
 	if err != nil || len(items) != 0 {
 		t.Fatal("cross tenant leakage", err)
 	}
-	if err = f.store.RemoveTenantMCP(f.ctx, a, space, item.ID, item.Revision); err != nil {
-		t.Fatal(err)
+	for _, key := range []string{"", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{8}, 32))} {
+		t.Run("deployment key unavailable", func(t *testing.T) {
+			t.Setenv("V2_MARKET_CREDENTIAL_KEY", key)
+			rows, err := f.store.TenantMCPs(f.ctx, a)
+			if err != nil || len(rows) != 1 || rows[0].ID != item.ID || rows[0].Revision != item.Revision || !rows[0].SettingsUnavailable || rows[0].Complete || len(rows[0].ConfiguredSecrets) != 0 {
+				t.Fatal("unreadable settings obscured installation identity or looked usable", err)
+			}
+			_, err = f.store.ResolveWorkflowMCP(f.ctx, scope, "mcp-project", []string{item.ID})
+			var setup *execution.MCPFailure
+			if !errors.Is(err, pluginmarket.ErrCredentials) || errors.As(err, &setup) {
+				t.Fatal("credential failure lost its infrastructure classification", err)
+			}
+		})
 	}
+	t.Run("remove without deployment key", func(t *testing.T) {
+		t.Setenv("V2_MARKET_CREDENTIAL_KEY", "")
+		if err := f.store.RemoveTenantMCP(f.ctx, a, space, item.ID, item.Revision); err != nil {
+			t.Fatal(err)
+		}
+	})
 	if _, err = f.store.ResolveWorkflowMCP(f.ctx, scope, "mcp-project", []string{item.ID}); err == nil {
 		t.Fatal("removed plugin selected")
 	}

@@ -62,9 +62,11 @@ Agent 把被切断的模型请求当成网络失败原样重发（OpenCode 0.6.1
 
 工作流显式 MCP 选择经 `execution.MCPSelection` 进入会话。启动前核验有序规范身份、精确版本、16 项和 64 KiB 上限；非空选择要求当前 Node 同时广告 `agent_session`、`session_mcp`、`session_mcp_lifecycle`。缺能力返回 `mcp_node_capability_missing`，不降级为冻结 setup。空选择省略 MCP 协议字段，禁用的工作流绑定不计入选择，仍可按原能力运行。
 
-当前固定 Node（版本以 `scripts/prepare-node.sh` 的 `source_commit` 为准）已具备 `session_mcp_lifecycle`，真实握手测试核验该能力。但 Controller 尚未接入 generation 准入、可靠 `SessionTurnFailed` 及新协议派发，仍返回 `mcp_lifecycle_not_ready`；使用缺少该能力的旧资产时返回 `mcp_node_capability_missing`。两种拒绝都发生在 clone、安装会话所需插件和 Agent Start 之前。当前非空 MCP 工作流暂不能执行，租户安装和配置可以独立使用。后续生命周期接入完成后才能移除 Controller 门禁，同时启用 `mcp_lifecycle:true` 和对应轮次协议，不能仅通过能力检查后继续发送冻结 setup。
+固定 Node 的版本见 `scripts/prepare-node.sh` 的 `source_commit`。驱动为生命周期会话构造带 `mcp_lifecycle:true` 的首轮，追加轮携带准入事务返回的 `mcp_generation`；可靠的 `SessionTurnFailed` 在结果写入后确认。Controller 在首轮前读取已提交的完整目标并安装精确版本。配置事务提交后唤醒选中该插件的会话；驱动核对 Node 的 desired generation、发送完整更新并等待确认。若 Node 返回 `mcp_update_required`，驱动先核对已提交目标，再重发相同的 command 和 turn。
 
-包安装与 `spec.mcp` 构造保留为独立接缝及单测，未接入当前被拒绝的启动路径。设置值仅驻留会话内存，停止后释放引用；包安装帧、准备文件和执行持久快照均不含设置值。MCP 失败保留稳定 code 以及可选 `plugin_id`、`setting_id`、`transport`，工作流将其映射为可手动恢复、禁止自动重试的配置失败。这些测试不代表生命周期、刷新或健康探测已经实现。
+包安装帧只携带归档身份与摘要。设置通过 Start 或 Update 的私有帧送入 Node，驱动在首轮派发后只保留选择身份。只读状态与手动探测通过当前 Node 的 incarnation、execution 和 request ID 关联响应。MCP 失败保留稳定 code 以及可选 `plugin_id`、`setting_id`、`transport`，工作流将其映射为可手动恢复、禁止自动重试的配置失败。`TestRealWorkflowMCPLifecycle` 使用本地 stdio MCP 及真实 Node/OpenCode，检查繁忙轮次保留原设置、后续轮次使用新设置和宿主探测结果。
+
+重新加载界面后，状态查询仍使用原会话及其显式选择。若 Node 进程已经丢失，原 provider session 无法用当前协议重新绑定，后续轮次以 `agent_transport_closed` 结束。普通会话沿用已有的历史交接逻辑。
 
 包级 `go vet` / `go test -race` 验证登记恢复、拒绝未知路径和 symlink、保留工作文件、runtime 锁及无效终态不能确认停止。
 设置 `V2_NODE_ASSETS_DIR` 后，`TestRealRebuildRetiresUnacknowledgedNodeBeforeNextSession` 用真实 Node/OpenCode 验证：Node 不确认 End 时 `Rebuild` 只标记，同一项目的下一个会话先由 supervisor 停掉旧进程树，再在新 Node 上执行。

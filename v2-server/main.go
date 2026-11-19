@@ -224,7 +224,7 @@ func runWithListener(addr, dbURL string, cleanup, fixture, testFixtures bool, li
 		}, ResolveProject: func(c context.Context, scope execution.Scope, id string) (agentruntime.Project, error) {
 			p, e := db.GetProject(c, scope, id)
 			return agentruntime.Project{MirrorPath: p.MirrorPath, Commit: p.Commit, SnapshotRef: p.SnapshotRef}, e
-		}, UserSkills: func(c context.Context, scope execution.Scope) ([]agentruntime.UserSkill, error) {
+		}, ReadMCPTarget: db.ReadSessionMCPTarget, UserSkills: func(c context.Context, scope execution.Scope) ([]agentruntime.UserSkill, error) {
 			items, e := db.UserSkillDocuments(c, scope.TenantID, scope.UserID)
 			if e != nil {
 				return nil, e
@@ -246,6 +246,7 @@ func runWithListener(addr, dbURL string, cleanup, fixture, testFixtures bool, li
 	var agent executionruntime.AgentDriver
 	if driver != nil {
 		agent = driver
+		db.SetMCPChangeObserver(driver.MCPChanged)
 	}
 	runtime, e := executionruntime.New(ctx, executionruntime.Config{Store: db, Models: models, Agent: agent, Delivery: delivery})
 	if e != nil {
@@ -370,6 +371,9 @@ func runWithListener(addr, dbURL string, cleanup, fixture, testFixtures bool, li
 		// The signal context ends with the process, before the database pool is closed.
 		Context: ctx,
 	}, workflowRuns)
+	if driver != nil {
+		options.SessionMCP = driver
+	}
 	coordinator, e := server.NewScheduleCoordinator(db, options, time.Now)
 	if e != nil {
 		return e

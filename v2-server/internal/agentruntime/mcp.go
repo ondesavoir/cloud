@@ -13,22 +13,39 @@ import (
 	"github.com/wanglongan587/cloud/v2-server/internal/nodeservices"
 )
 
-func (p *projectRuntime) prepareMCP(selected *execution.MCPSelection) error {
+func (d *Driver) SupportsMCPLifecycle() bool { return d.opts.ReadMCPTarget != nil }
+
+func (a *agentSession) prepareMCP(ctx context.Context, selected *execution.MCPSelection) error {
 	if selected == nil || len(selected.Bindings) == 0 {
 		return nil
 	}
-	if err := selected.Validate(); err != nil {
-		return err
-	}
+	p := a.project
 	capable, ok := p.ipc().(interface{ Supports(string) bool })
 	// Cloud v2 must not downgrade a nonempty selection to a frozen setup on older Nodes.
 	if !ok || !capable.Supports("session_mcp") || !capable.Supports("agent_session") || !capable.Supports("session_mcp_lifecycle") {
 		return &execution.MCPFailure{Code: "mcp_node_capability_missing"}
 	}
-	// Lifecycle startup also requires generation admission and reliable SessionTurnFailed
-	// consumption. Until that Controller integration is available, even a newer Node must
-	// not receive a frozen setup as an implicit fallback.
-	return &execution.MCPFailure{Code: "mcp_lifecycle_not_ready"}
+	if p.driver.opts.ReadMCPTarget == nil {
+		return &execution.MCPFailure{Code: "mcp_lifecycle_not_ready"}
+	}
+	target, err := p.driver.opts.ReadMCPTarget(ctx, a.scope, a.frozen.ID, selected, -1)
+	if err != nil {
+		return err
+	}
+	if target == nil || target.Generation != 0 || !selected.SameMembers(&target.Configured) || len(target.Unavailable) != 0 || len(target.Configured.Packages) != len(selected.Bindings) {
+		return execution.ErrConflict
+	}
+	if err := target.Configured.Validate(); err != nil {
+		return err
+	}
+	for _, pkg := range target.Configured.Packages {
+		if err := p.installMCP(ctx, pkg); err != nil {
+			return err
+		}
+	}
+	target.Configured.Packages = nil
+	a.frozen.MCP = &target.Configured
+	return nil
 }
 
 // installMCP stages only package bytes. Settings never enter files, package URLs or install frames.
