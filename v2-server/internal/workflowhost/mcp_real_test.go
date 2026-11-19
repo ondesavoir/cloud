@@ -3,12 +3,9 @@
 package workflowhost
 
 import (
-	"archive/zip"
 	"bytes"
 	"context"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -29,6 +26,7 @@ import (
 	"github.com/wanglongan587/cloud/v2-server/internal/server"
 	"github.com/wanglongan587/cloud/v2-server/internal/store"
 	"github.com/wanglongan587/cloud/v2-server/internal/store/storetest"
+	"github.com/wanglongan587/cloud/v2-server/internal/workflowhost/testdata/mcpfixture"
 )
 
 const mcpFixtureSecret = "workflow-mcp-private-token"
@@ -101,80 +99,6 @@ func (m *workflowMCPModel) Complete(w http.ResponseWriter, r *http.Request, mode
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 }
 
-func workflowMCPArchive(t *testing.T) ([]byte, string) {
-	t.Helper()
-	var archive bytes.Buffer
-	z := zip.NewWriter(&archive)
-	files := map[string]string{
-		"orax.toml":          "resolver = 1\nidentifier = \"fixture.workflow-mcp\"\nkind = \"mcp\"\nversion = \"1.0.0\"\ndescription = \"Workflow MCP integration fixture\"\n",
-		"assets/config.json": `{"schemaVersion":1,"settings":{"token":{"type":"string","title":"Token","description":"Private test credential","required":true,"secret":true}},"transport":{"type":"stdio","command":"assets/server","env":{"MCP_TOKEN":{"setting":"token"}}}}`,
-		"assets/server": `#!/usr/bin/python3
-import json, os, sys
-for line in sys.stdin:
-    request = json.loads(line)
-    if 'id' not in request:
-        continue
-    method = request.get('method')
-    if method == 'initialize':
-        result = {'protocolVersion': request['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'workflow-fixture', 'version': '1.0.0'}}
-    elif method == 'tools/list':
-        result = {'tools': [{'name': 'mcp_probe', 'description': 'Verify selected MCP configuration', 'inputSchema': {'type': 'object', 'properties': {}}}]}
-    elif method == 'tools/call':
-        markers = {'workflow-mcp-private-token': 'MCP_SETTINGS_RECEIVED', 'changed-fixture-token': 'MCP_SETTINGS_UPDATED'}
-        result = {'content': [{'type': 'text', 'text': markers.get(os.environ.get('MCP_TOKEN'), 'MCP_SETTINGS_MISSING')}]}
-    else:
-        result = {}
-    print(json.dumps({'jsonrpc': '2.0', 'id': request['id'], 'result': result}), flush=True)
-`,
-	}
-	for name, content := range files {
-		header := &zip.FileHeader{Name: name, Method: zip.Deflate}
-		header.SetMode(0644)
-		if name == "assets/server" {
-			header.SetMode(0755)
-		}
-		writer, err := z.CreateHeader(header)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err = writer.Write([]byte(content)); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := z.Close(); err != nil {
-		t.Fatal(err)
-	}
-	digest := sha256.Sum256(archive.Bytes())
-	return archive.Bytes(), hex.EncodeToString(digest[:])
-}
-
-// The browser test installs the same stdio fixture into its isolated Playwright database.
-func TestInstallBrowserMCPFixture(t *testing.T) {
-	tenant := os.Getenv("E2E_MCP_FIXTURE_TENANT")
-	if tenant == "" {
-		t.Skip("only invoked by the browser lifecycle test")
-	}
-	ctx := t.Context()
-	db, err := store.Open(ctx, os.Getenv("E2E_DATABASE_URL"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer db.Close()
-	access, err := db.TenantAccess(ctx, tenant, os.Getenv("E2E_MCP_FIXTURE_USER"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	archive, digest := workflowMCPArchive(t)
-	source := workflowMCPSource(digest)
-	if _, err := db.InstallTenantMCP(ctx, access, os.Getenv("E2E_MCP_FIXTURE_SPACE"), source, archive, 0); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func workflowMCPSource(digest string) store.PluginPackageSource {
-	return store.PluginPackageSource{Entry: store.PluginCatalogEntry{ID: "official/fixture.workflow-mcp", SourceNamespace: "official", Identifier: "fixture.workflow-mcp", Kind: "mcp", Version: "1.0.0", Title: "Workflow MCP", MarketplaceVisible: true}, Digest: digest}
-}
-
 func TestInteractiveMCPKeyFailureBeforeStart(t *testing.T) {
 	f := newFixture(t)
 	ctx := t.Context()
@@ -184,8 +108,7 @@ func TestInteractiveMCPKeyFailureBeforeStart(t *testing.T) {
 		t.Fatal("fixture space unavailable", err)
 	}
 	t.Setenv("V2_MARKET_CREDENTIAL_KEY", base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32)))
-	archive, digest := workflowMCPArchive(t)
-	item, err := f.s.InstallTenantMCP(ctx, access, spaces[0].ID, workflowMCPSource(digest), archive, 0)
+	item, err := mcpfixture.Install(ctx, f.s, access, spaces[0].ID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -291,13 +214,11 @@ func TestRealWorkflowMCPLifecycle(t *testing.T) {
 			t.Error(err)
 		}
 	})
-	archive, digest := workflowMCPArchive(t)
 	access, err := db.TenantAccess(ctx, tenant, user)
 	if err != nil {
 		t.Fatal(err)
 	}
-	source := workflowMCPSource(digest)
-	installed, err := db.InstallTenantMCP(ctx, access, project.SpaceID, source, archive, 0)
+	installed, err := mcpfixture.Install(ctx, db, access, project.SpaceID)
 	if err != nil {
 		t.Fatal(err)
 	}
